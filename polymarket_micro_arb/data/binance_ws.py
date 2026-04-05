@@ -155,7 +155,30 @@ class BinanceWSClient:
 
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and self._ws.open
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+            return self._ws.state == State.OPEN
+        except (AttributeError, ImportError):
+            state = getattr(self._ws, "state", None)
+            if isinstance(state, int):
+                return state == 1
+            return getattr(self._ws, "open", False)
+
+
+def _ws_is_connected(ws) -> bool:
+    """Shared helper for websockets v16 compatibility."""
+    if ws is None:
+        return False
+    try:
+        from websockets.protocol import State
+        return ws.state == State.OPEN
+    except (AttributeError, ImportError):
+        state = getattr(ws, "state", None)
+        if isinstance(state, int):
+            return state == 1
+        return getattr(ws, "open", False)
 
 
 class BybitWSClient:
@@ -244,3 +267,7 @@ class BybitWSClient:
         if self._ws:
             await self._ws.close()
             logger.info("Bybit WS stopped")
+
+    @property
+    def is_connected(self) -> bool:
+        return _ws_is_connected(self._ws)

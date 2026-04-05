@@ -67,10 +67,22 @@ python scripts/daily_report.py
 
 ## Environment
 
-- Python 3.11+
-- Key deps: `py-clob-client`, `websockets`, `aiohttp`, `pydantic`, `loguru`, `streamlit`
+- Python 3.12.3, uv-managed venv at `.venv/` (use `uv pip`, not `pip`)
+- Key deps: `py-clob-client`, `websockets` v16, `aiohttp`, `pydantic`, `loguru`, `streamlit`
 - Config via `.env` (see `.env.example`)
 - Secrets: `PRIVATE_KEY` (Polygon EOA) — NEVER log or display this
+- Polygon chain (ID 137), wallet funded with MATIC + USDC.e
+- websockets v16: `is_connected` uses `ws.state == 1` (not `ws.open` which was removed)
+
+## Systemd Services
+
+Both run as user services, auto-restart, survive reboots:
+```bash
+systemctl --user status polymarket-bot
+systemctl --user status polymarket-dashboard
+systemctl --user restart polymarket-bot
+journalctl --user -u polymarket-bot -f        # live logs
+```
 
 ## Common Tasks
 

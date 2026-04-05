@@ -9,6 +9,8 @@ Then open http://your-server-ip:8501 in your browser.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -22,6 +24,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+ENV_FILE = Path(__file__).parent / ".env"
 
 STATE_FILE = Path(__file__).parent / "bot_state.json"
 REFRESH_RATE = 3  # seconds
@@ -299,5 +303,135 @@ def main():
     st.rerun()
 
 
-if __name__ == "__main__":
+# ── Settings Page ──────────────────────────────────────────────────
+def load_env() -> dict[str, str]:
+    """Parse .env file into a dict, preserving order."""
+    values = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, val = line.partition("=")
+                values[key.strip()] = val.strip()
+    return values
+
+
+def save_env(values: dict[str, str]) -> None:
+    """Write values back to .env, preserving comments and structure."""
+    lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
+    new_lines = []
+    written_keys = set()
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in values:
+                new_lines.append(f"{key}={values[key]}")
+                written_keys.add(key)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+    # Append any new keys
+    for key, val in values.items():
+        if key not in written_keys:
+            new_lines.append(f"{key}={val}")
+    ENV_FILE.write_text("\n".join(new_lines) + "\n")
+
+
+def restart_bot() -> str:
+    """Restart the bot via systemd."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", "polymarket-bot"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return "Bot restarted successfully."
+        return f"Restart failed: {result.stderr}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+SETTINGS_GROUPS = {
+    "Strategy": [
+        ("MOMENTUM_THRESHOLD", "Momentum Threshold", "Min price move to trigger signal (e.g. 0.0015 = 0.15%)"),
+        ("MOMENTUM_WINDOW_START_SEC", "Window Start (sec)", "Seconds after bucket open to start looking"),
+        ("MOMENTUM_WINDOW_END_SEC", "Window End (sec)", "Seconds after bucket open to stop looking"),
+        ("VOLUME_CONFIRM_MULTIPLIER", "Volume Multiplier", "1.0 = any volume, 1.5 = above average"),
+        ("CROSS_OUTCOME_THRESHOLD", "Cross-Outcome Threshold", "Max YES+NO ask sum for arb (e.g. 0.99)"),
+        ("MIN_SPREAD_PROFIT", "Min Spread Profit", "Minimum edge to take a trade"),
+    ],
+    "Risk": [
+        ("MAX_BANKROLL_PERCENT", "Max Bankroll %", "Max % of bankroll per trade"),
+        ("MAX_DAILY_LOSS_PERCENT", "Max Daily Loss %", "Kill-switch: pause if daily loss exceeds this"),
+        ("MAX_CONSECUTIVE_LOSSES", "Max Consecutive Losses", "Kill-switch: pause after N losses in a row"),
+        ("KELLY_FRACTION", "Kelly Fraction", "Fraction of Kelly criterion to use (0.25 = quarter Kelly)"),
+    ],
+    "Orders": [
+        ("MIN_ORDER_SIZE", "Min Order Size ($)", "Minimum order in dollars"),
+        ("MAX_ORDER_SIZE", "Max Order Size ($)", "Maximum order in dollars"),
+    ],
+    "Mode": [
+        ("TRADING_MODE", "Trading Mode", "paper_trade or live"),
+        ("SYMBOLS", "Symbols", "Comma-separated: BTCUSDT,ETHUSDT,SOLUSDT"),
+    ],
+}
+
+
+def settings_page():
+    st.title("Settings")
+
+    env = load_env()
+    updated = {}
+
+    for group_name, fields in SETTINGS_GROUPS.items():
+        st.subheader(group_name)
+        cols = st.columns(2)
+        for i, (key, label, help_text) in enumerate(fields):
+            with cols[i % 2]:
+                current = env.get(key, "")
+                if key == "TRADING_MODE":
+                    new_val = st.selectbox(
+                        label, ["paper_trade", "live"],
+                        index=0 if current != "live" else 1,
+                        help=help_text, key=key,
+                    )
+                else:
+                    new_val = st.text_input(label, value=current, help=help_text, key=key)
+                updated[key] = str(new_val)
+
+    st.divider()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Save Settings", type="primary"):
+            save_env(updated)
+            st.success("Settings saved to .env")
+    with col2:
+        if st.button("Save & Restart Bot"):
+            save_env(updated)
+            msg = restart_bot()
+            if "successfully" in msg:
+                st.success(msg)
+            else:
+                st.error(msg)
+    with col3:
+        if st.button("Restart Bot (no save)"):
+            msg = restart_bot()
+            if "successfully" in msg:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+    st.divider()
+    st.caption("Changes only take effect after restarting the bot.")
+
+
+# ── Page Router ────────────────────────────────────────────────────
+page = st.sidebar.radio("Page", ["Dashboard", "Settings"], index=0)
+
+if page == "Dashboard":
     main()
+else:
+    settings_page()
