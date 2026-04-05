@@ -1,7 +1,5 @@
-"""Lightweight async Telegram alerting via httpx.
-
-We use httpx directly instead of python-telegram-bot to keep the
-dependency footprint minimal and avoid blocking the event loop.
+"""Async Telegram alerting for trade entries, exits, daily summaries,
+kill-switch triggers, and low-balance warnings.
 """
 
 from __future__ import annotations
@@ -50,7 +48,7 @@ async def send_trade_alert(
     price: float,
     edge: float,
 ) -> bool:
-    """Format and send a trade execution alert."""
+    """Format and send a trade entry alert."""
     msg = (
         f"<b>{action}</b>\n"
         f"Market: <code>{market_slug}</code>\n"
@@ -61,9 +59,43 @@ async def send_trade_alert(
     return await send_alert(msg)
 
 
+async def send_exit_alert(
+    market_slug: str,
+    outcome: str,
+    pnl: float,
+    entry_price: float,
+    exit_price: float,
+) -> bool:
+    """Send a position exit / resolution alert."""
+    emoji = "+" if pnl >= 0 else ""
+    msg = (
+        f"<b>EXIT</b>\n"
+        f"Market: <code>{market_slug}</code>\n"
+        f"Outcome: {outcome}\n"
+        f"Entry: {entry_price:.4f} -> Exit: {exit_price:.4f}\n"
+        f"P&L: <code>{emoji}${pnl:.4f}</code>"
+    )
+    return await send_alert(msg)
+
+
+async def send_daily_summary(summary: str) -> bool:
+    """Send end-of-day performance summary."""
+    return await send_alert(summary)
+
+
 async def send_risk_alert(reason: str, details: str = "") -> bool:
     """Send a risk / kill-switch alert."""
-    msg = f"⚠️ <b>RISK ALERT</b>\n{reason}"
+    msg = f"<b>RISK ALERT</b>\n{reason}"
     if details:
         msg += f"\n<pre>{details}</pre>"
+    return await send_alert(msg)
+
+
+async def send_low_balance_alert(bankroll: float) -> bool:
+    """Alert when bankroll drops below threshold."""
+    msg = (
+        f"<b>LOW BALANCE WARNING</b>\n"
+        f"Current bankroll: <code>${bankroll:.2f}</code>\n"
+        f"Trading may be paused due to insufficient funds."
+    )
     return await send_alert(msg)

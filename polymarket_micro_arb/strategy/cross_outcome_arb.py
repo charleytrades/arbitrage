@@ -1,11 +1,10 @@
-"""Cross-Outcome Arbitrage Strategy.
+"""Cross-Outcome Arbitrage Strategy (always-on, risk-free).
 
-On a binary market, YES + NO must sum to $1.00 at settlement.
-If we can buy YES at ask_y and NO at ask_n where ask_y + ask_n < 1.0,
-we lock in a risk-free profit of (1.0 - ask_y - ask_n) per dollar.
+For every active bucket: if (Yes ask + No ask) < 0.99, buy both
+sides in exact dollar ratio for risk-free profit at settlement.
 
-This is "free money" arbitrage – the only risk is execution slippage
-and the spread not being fillable at the quoted prices.
+The only risk is execution: both legs must fill. We mitigate this
+with limit orders and conservative sizing.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from polymarket_micro_arb.utils.logger import logger
 
 
 class CrossOutcomeArbStrategy:
-    """Detects YES + NO ask sum < threshold (typically < 0.99)."""
+    """Detects YES + NO ask sum < 0.99 for guaranteed profit."""
 
     def __init__(
         self,
@@ -39,7 +38,7 @@ class CrossOutcomeArbStrategy:
 
         # Cooldown per market
         self._last_signal_ts: dict[str, float] = {}
-        self._signal_cooldown = 5.0  # Seconds between arb signals
+        self._signal_cooldown = 3.0  # Fast re-scan for arb
 
     def evaluate(self, markets: list[MarketInfo]) -> list[Signal]:
         """Scan all markets for cross-outcome arbitrage opportunities."""
@@ -66,37 +65,57 @@ class CrossOutcomeArbStrategy:
             # Skip if we don't have real book data yet
             if yes_ask >= 1.0 or no_ask >= 1.0:
                 continue
+            if yes_ask <= 0.0 or no_ask <= 0.0:
+                continue
 
             total_cost = yes_ask + no_ask
-            profit = 1.0 - total_cost  # Guaranteed profit per $1 of each
+            profit = 1.0 - total_cost  # Guaranteed profit per $1 of each side
 
             if total_cost < self.threshold and profit > self.min_profit:
                 self._last_signal_ts[market.condition_id] = now
 
+                # Get available liquidity to size properly
+                yes_book = self.polymarket_ws.get_book(market.token_id_yes)
+                no_book = self.polymarket_ws.get_book(market.token_id_no)
+                yes_liq = yes_book.best_ask_size if yes_book else 0.0
+                no_liq = no_book.best_ask_size if no_book else 0.0
+
+                # Size to the minimum available liquidity on either side
+                max_shares = min(yes_liq, no_liq)
+                if max_shares <= 0:
+                    continue
+
                 logger.info(
-                    "Cross-outcome arb detected",
+                    "CROSS-OUTCOME ARB: YES+NO < $0.99",
                     market=market.slug,
                     yes_ask=f"{yes_ask:.4f}",
                     no_ask=f"{no_ask:.4f}",
                     total_cost=f"{total_cost:.4f}",
-                    profit=f"{profit:.4f}",
+                    profit_per_unit=f"{profit:.4f}",
+                    available_shares=f"{max_shares:.2f}",
                 )
 
-                # Emit TWO signals – buy both YES and NO
+                # Emit paired signals – both must execute for arb to work
+                # Confidence is 1.0 because this is a mathematical certainty
+                pair_id = f"arb_{market.condition_id}_{int(now)}"
+
                 signals.append(
                     Signal(
                         signal_type=SignalType.CROSS_OUTCOME_ARB,
                         market=market,
                         side=Side.BUY,
                         outcome=Outcome.YES,
-                        confidence=min(1.0, profit / self.min_profit),
-                        edge=profit / 2,  # Split edge attribution
+                        confidence=1.0,
+                        edge=profit / 2,
+                        limit_price=round(yes_ask, 4),
                         meta={
                             "yes_ask": yes_ask,
                             "no_ask": no_ask,
                             "total_cost": total_cost,
                             "profit": profit,
                             "pair_trade": True,
+                            "pair_id": pair_id,
+                            "max_shares": max_shares,
                         },
                     )
                 )
@@ -106,14 +125,17 @@ class CrossOutcomeArbStrategy:
                         market=market,
                         side=Side.BUY,
                         outcome=Outcome.NO,
-                        confidence=min(1.0, profit / self.min_profit),
+                        confidence=1.0,
                         edge=profit / 2,
+                        limit_price=round(no_ask, 4),
                         meta={
                             "yes_ask": yes_ask,
                             "no_ask": no_ask,
                             "total_cost": total_cost,
                             "profit": profit,
                             "pair_trade": True,
+                            "pair_id": pair_id,
+                            "max_shares": max_shares,
                         },
                     )
                 )

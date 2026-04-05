@@ -12,6 +12,13 @@ SYMBOL_TO_SLUG_PREFIX: dict[str, str] = {
     "SOLUSDT": "sol",
 }
 
+# Map Bybit symbol format → Binance-style
+BYBIT_TO_BINANCE_SYMBOL: dict[str, str] = {
+    "BTCUSDT": "BTCUSDT",
+    "ETHUSDT": "ETHUSDT",
+    "SOLUSDT": "SOLUSDT",
+}
+
 BUCKET_DURATIONS_SEC: dict[str, int] = {
     "5m": 300,
     "15m": 900,
@@ -40,7 +47,7 @@ class Outcome(str, Enum):
 # ── Timing ──────────────────────────────────────────────────────────
 WS_PING_INTERVAL_SEC = 20
 WS_RECONNECT_DELAY_SEC = 2
-MARKET_REFRESH_INTERVAL_SEC = 60
+HEARTBEAT_INTERVAL_SEC = 60
 
 # ── Gamma API search tags ───────────────────────────────────────────
 GAMMA_CRYPTO_TAG = "crypto"

@@ -43,6 +43,10 @@ class MarketInfo(BaseModel):
     def seconds_remaining(self) -> float:
         return max(0.0, self.end_ts - time.time())
 
+    @property
+    def seconds_since_open(self) -> float:
+        return max(0.0, time.time() - self.start_ts)
+
 
 # ── Order-book snapshot (simplified) ────────────────────────────────
 class BookLevel(BaseModel):
@@ -64,6 +68,14 @@ class OrderBookSnapshot(BaseModel):
     def best_ask(self) -> float:
         return self.asks[0].price if self.asks else 1.0
 
+    @property
+    def best_bid_size(self) -> float:
+        return self.bids[0].size if self.bids else 0.0
+
+    @property
+    def best_ask_size(self) -> float:
+        return self.asks[0].size if self.asks else 0.0
+
 
 # ── Binance tick ────────────────────────────────────────────────────
 class BinanceTick(BaseModel):
@@ -71,6 +83,7 @@ class BinanceTick(BaseModel):
     price: float
     timestamp_ms: int
     volume: float = 0.0
+    source: str = "binance"  # "binance" or "bybit"
 
 
 # ── Trading signal ──────────────────────────────────────────────────
@@ -81,6 +94,7 @@ class Signal(BaseModel):
     outcome: Outcome
     confidence: float  # 0.0–1.0
     edge: float  # estimated edge in price terms
+    limit_price: float = 0.0  # Limit order price to use
     timestamp: float = Field(default_factory=time.time)
     meta: dict = Field(default_factory=dict)
 
@@ -96,10 +110,19 @@ class Position(BaseModel):
     exit_price: float | None = None
     exit_ts: float | None = None
     pnl: float = 0.0
+    order_id: str = ""
+    realized: bool = False  # True when resolved at market expiry
 
     @property
     def is_open(self) -> bool:
         return self.exit_ts is None
+
+    @property
+    def unrealized_pnl(self) -> float:
+        """Estimate unrealized PnL (assumes fair value = entry for now)."""
+        if not self.is_open:
+            return 0.0
+        return 0.0  # Updated by strategy loop with live prices
 
 
 # ── Order result ────────────────────────────────────────────────────
@@ -110,3 +133,16 @@ class OrderResult(BaseModel):
     avg_price: float = 0.0
     error: str = ""
     timestamp: float = Field(default_factory=time.time)
+
+
+# ── Daily stats snapshot ────────────────────────────────────────────
+class DailyStats(BaseModel):
+    date: str = ""
+    total_trades: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+    win_rate: float = 0.0
+    bankroll: float = 0.0
+    max_drawdown: float = 0.0

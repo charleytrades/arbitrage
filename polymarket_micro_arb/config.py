@@ -42,15 +42,24 @@ class Settings(BaseSettings):
         "wss://stream.binance.com:9443/ws", alias="BINANCE_WS_URL"
     )
 
+    # ── Bybit (multi-venue confirmation) ────────────────────────────
+    bybit_ws_url: str = Field(
+        "wss://stream.bybit.com/v5/public/spot", alias="BYBIT_WS_URL"
+    )
+
     # ── Telegram ────────────────────────────────────────────────────
     telegram_bot_token: str = Field("", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field("", alias="TELEGRAM_CHAT_ID")
 
     # ── Risk ────────────────────────────────────────────────────────
-    max_bankroll_percent: float = Field(2.0, alias="MAX_BANKROLL_PERCENT")
-    max_daily_loss_percent: float = Field(5.0, alias="MAX_DAILY_LOSS_PERCENT")
-    max_consecutive_losses: int = Field(5, alias="MAX_CONSECUTIVE_LOSSES")
+    max_bankroll_percent: float = Field(4.0, alias="MAX_BANKROLL_PERCENT")
+    max_daily_loss_percent: float = Field(8.0, alias="MAX_DAILY_LOSS_PERCENT")
+    max_consecutive_losses: int = Field(3, alias="MAX_CONSECUTIVE_LOSSES")
+    consecutive_loss_cooldown_sec: int = Field(
+        1800, alias="CONSECUTIVE_LOSS_COOLDOWN_SEC"
+    )
     kelly_fraction: float = Field(0.25, alias="KELLY_FRACTION")
+    max_concurrent_buckets: int = Field(8, alias="MAX_CONCURRENT_BUCKETS")
 
     # ── Trading mode ────────────────────────────────────────────────
     trading_mode: Literal["backtest", "paper_trade", "live"] = Field(
@@ -61,14 +70,21 @@ class Settings(BaseSettings):
     symbols: str = Field("BTCUSDT,ETHUSDT,SOLUSDT", alias="SYMBOLS")
 
     # ── Strategy parameters ─────────────────────────────────────────
-    momentum_threshold: float = Field(0.0015, alias="MOMENTUM_THRESHOLD")
+    momentum_threshold: float = Field(0.0035, alias="MOMENTUM_THRESHOLD")
+    momentum_window_start_sec: int = Field(15, alias="MOMENTUM_WINDOW_START_SEC")
+    momentum_window_end_sec: int = Field(45, alias="MOMENTUM_WINDOW_END_SEC")
     latency_edge_ms: int = Field(500, alias="LATENCY_EDGE_MS")
     cross_outcome_threshold: float = Field(0.99, alias="CROSS_OUTCOME_THRESHOLD")
     min_spread_profit: float = Field(0.005, alias="MIN_SPREAD_PROFIT")
+    volume_confirm_multiplier: float = Field(1.5, alias="VOLUME_CONFIRM_MULTIPLIER")
 
-    # ── Order sizing ────────────────────────────────────────────────
+    # ── Order management ────────────────────────────────────────────
     min_order_size: float = Field(5.0, alias="MIN_ORDER_SIZE")
     max_order_size: float = Field(100.0, alias="MAX_ORDER_SIZE")
+    order_ttl_sec: int = Field(60, alias="ORDER_TTL_SEC")
+
+    # ── Market discovery ────────────────────────────────────────────
+    market_refresh_interval_sec: int = Field(30, alias="MARKET_REFRESH_INTERVAL_SEC")
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
