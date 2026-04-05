@@ -32,6 +32,7 @@ from polymarket_micro_arb.models import BinanceTick, MarketInfo, Signal
 from polymarket_micro_arb.risk.risk_engine import RiskEngine
 from polymarket_micro_arb.strategy.cross_outcome_arb import CrossOutcomeArbStrategy
 from polymarket_micro_arb.strategy.momentum_latency import MomentumLatencyStrategy
+from polymarket_micro_arb.dashboard.state import StateWriter
 from polymarket_micro_arb.utils.backtester import Backtester, BacktestConfig
 from polymarket_micro_arb.utils.logger import logger
 from polymarket_micro_arb.utils.telegram_alerts import (
@@ -68,6 +69,12 @@ class Bot:
         # ── Execution & risk ────────────────────────────────────────
         self._executor = ClobExecutor()
         self._risk = RiskEngine(initial_bankroll=1_000.0)
+
+        # ── Dashboard state writer ──────────────────────────────────
+        self._state_writer = StateWriter()
+        self._recent_signals: list[dict] = []
+        self._trade_log: list[dict] = []
+        self._equity_curve: list[float] = [1_000.0]
 
         # ── Daily summary tracking ──────────────────────────────────
         self._last_daily_summary_ts = time.time()
@@ -120,6 +127,7 @@ class Bot:
                 tg.create_task(self._order_management_loop(), name="order_mgmt")
                 tg.create_task(self._heartbeat_loop(), name="heartbeat")
                 tg.create_task(self._daily_summary_loop(), name="daily_summary")
+                tg.create_task(self._state_update_loop(), name="state_writer")
                 tg.create_task(self._wait_for_shutdown(), name="shutdown_watcher")
         except* Exception as eg:
             # TaskGroup catches all exceptions from child tasks
@@ -163,6 +171,22 @@ class Bot:
                 signals: list[Signal] = []
                 signals.extend(self._momentum.evaluate(self._markets))
                 signals.extend(self._cross_arb.evaluate(self._markets))
+
+                # ── Track signals for dashboard ─────────────────────
+                for sig in signals:
+                    self._recent_signals.append({
+                        "timestamp": sig.timestamp,
+                        "signal_type": sig.signal_type.value,
+                        "market": sig.market.model_dump(),
+                        "outcome": sig.outcome.value,
+                        "side": sig.side.value,
+                        "confidence": sig.confidence,
+                        "edge": sig.edge,
+                        "limit_price": sig.limit_price,
+                    })
+                # Cap signal history
+                if len(self._recent_signals) > 200:
+                    self._recent_signals = self._recent_signals[-100:]
 
                 # ── Execute signals through risk engine ─────────────
                 for sig in signals:
@@ -227,6 +251,21 @@ class Bot:
 
             pnl = self._executor.close_position(pos, exit_price)
             self._risk.record_trade(pnl)
+
+            # Track for dashboard
+            self._equity_curve.append(self._risk.state.bankroll)
+            self._trade_log.append({
+                "time": time.strftime("%H:%M:%S", time.gmtime(now)),
+                "market": pos.market.slug,
+                "signal_type": "resolution",
+                "outcome": pos.outcome.value,
+                "size": pos.size,
+                "entry": pos.entry_price,
+                "exit": exit_price,
+                "pnl": pnl,
+            })
+            if len(self._trade_log) > 200:
+                self._trade_log = self._trade_log[-100:]
 
             # Send exit alert
             asyncio.get_running_loop().create_task(
@@ -320,6 +359,55 @@ class Bot:
                 raise
             except Exception as exc:
                 logger.error("Heartbeat error", error=str(exc))
+
+    async def _state_update_loop(self) -> None:
+        """Write bot state to JSON every 2s for the Streamlit dashboard."""
+        while not self._shutdown_event.is_set():
+            try:
+                rs = self._risk.state
+                self._state_writer.update(
+                    mode=self.mode.value,
+                    uptime_sec=time.time() - self._start_time,
+                    # Risk
+                    bankroll=rs.bankroll,
+                    daily_pnl=rs.daily_pnl,
+                    total_pnl=rs.total_pnl,
+                    total_trades=rs.total_trades,
+                    winning_trades=rs.winning_trades,
+                    losing_trades=rs.losing_trades,
+                    consecutive_losses=rs.consecutive_losses,
+                    win_rate=self._risk.win_rate_str,
+                    drawdown=self._risk.current_drawdown,
+                    paused=rs.paused,
+                    pause_reason=rs.pause_reason,
+                    # Markets
+                    active_markets=[
+                        m.model_dump() for m in self._markets if m.active
+                    ],
+                    # Positions
+                    open_positions=[
+                        p.model_dump() for p in self._executor.get_open_positions()
+                    ],
+                    closed_positions=[
+                        p.model_dump() for p in self._executor.closed_positions
+                    ],
+                    # Signals
+                    recent_signals=self._recent_signals,
+                    # Connections
+                    binance_connected=self._binance_ws.is_connected,
+                    bybit_connected=hasattr(self._bybit_ws, '_ws') and self._bybit_ws._ws is not None,
+                    polymarket_books=len(self._polymarket_ws.books),
+                    tick_queue_size=self._tick_queue.qsize(),
+                    # Equity & trades
+                    equity_curve=self._equity_curve,
+                    trade_log=self._trade_log,
+                )
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("State update error", error=str(exc))
+                await asyncio.sleep(5)
 
     async def _daily_summary_loop(self) -> None:
         """Send daily Telegram summary every 24h."""
