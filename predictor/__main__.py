@@ -9,16 +9,18 @@ def main() -> None:
         "train": "predictor.train",
         "predict": "predictor.predict",
         "backtest": "predictor.backtest_cli",
+        "score": "predictor.score",
     }
 
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
-        print("Usage: python -m predictor {fetch|train|predict|backtest}")
+        print("Usage: python -m predictor {fetch|train|predict|backtest|score}")
         print()
         print("Commands:")
         print("  fetch     Download historical klines from Binance")
         print("  train     Train XGBoost models (walk-forward)")
         print("  predict   Run live predictions in a loop")
         print("  backtest  Evaluate model accuracy on historical data")
+        print("  score     Log predictions and verify against actual outcomes")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -33,6 +35,8 @@ def main() -> None:
         from predictor.predict import main as run
     elif cmd == "backtest":
         from predictor.backtest_cli import main as run
+    elif cmd == "score":
+        from predictor.score import main as run
 
     run()
 
