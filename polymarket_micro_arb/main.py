@@ -446,9 +446,14 @@ class Bot:
 
         while not self._shutdown_event.is_set():
             try:
+                remaining_cap = max(0, settings.broad_scan_max_markets - len(self._broad_markets))
+                if remaining_cap == 0:
+                    await asyncio.sleep(settings.broad_scan_refresh_sec)
+                    continue
+
                 new_markets = await self._gamma.discover_all_binary_markets(
                     known_ids=self._broad_known_ids,
-                    max_markets=settings.broad_scan_max_markets - len(self._broad_markets),
+                    max_markets=remaining_cap,
                 )
 
                 if new_markets:
