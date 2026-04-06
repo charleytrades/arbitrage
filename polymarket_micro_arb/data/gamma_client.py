@@ -109,6 +109,43 @@ class GammaClient:
             logger.warning("Gamma API error", slug=slug, error=str(exc))
             return None
 
+    # ── Market resolution (live mode) ──────────────────────────────
+    async def get_market_resolution(
+        self, condition_id: str
+    ) -> str | None:
+        """Query Gamma API for a market's resolution status.
+
+        Returns "Yes", "No", or None if not yet resolved.
+        """
+        session = await self._get_session()
+        url = f"{self.base_url}/markets"
+        try:
+            async with session.get(
+                url, params={"id": condition_id}
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if not data:
+                    return None
+                market = data[0] if isinstance(data, list) else data
+                if not market.get("closed", False):
+                    return None
+                # Gamma returns outcomePrices as JSON string, e.g. '["1","0"]'
+                # where outcomes[i] with price "1" is the winner
+                outcomes = market.get("outcomes", [])
+                prices = market.get("outcomePrices", "")
+                if isinstance(prices, str):
+                    import json as _json
+                    prices = _json.loads(prices)
+                for i, price in enumerate(prices):
+                    if float(price) >= 0.99 and i < len(outcomes):
+                        return outcomes[i]  # "Yes" or "No"
+                return None
+        except Exception as exc:
+            logger.debug("Resolution check failed", condition_id=condition_id, error=str(exc))
+            return None
+
     # ── Full binary-market scan (paginated) ──────────────────────────
     async def discover_all_binary_markets(
         self,

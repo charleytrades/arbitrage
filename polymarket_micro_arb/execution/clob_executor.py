@@ -228,15 +228,38 @@ class ClobExecutor:
         ]
 
         cancelled = 0
+        # Collect pair_ids of cancelled orders so we can cancel their partners
+        cancelled_pair_ids: set[str] = set()
+
         for order_id in stale:
             try:
                 self._client.cancel(order_id)
                 cancelled += 1
+                # Track pair_id for partner cancellation
+                _, signal = self._pending_orders.get(order_id, (0, None))
+                if signal and signal.meta.get("pair_trade"):
+                    cancelled_pair_ids.add(signal.meta["pair_id"])
                 logger.info("Auto-cancelled stale order", order_id=order_id, ttl_sec=ttl)
             except Exception as exc:
                 logger.warning("Failed to cancel stale order", order_id=order_id, error=str(exc))
             finally:
                 self._pending_orders.pop(order_id, None)
+
+        # Cancel partner legs of any cancelled arb pair
+        if cancelled_pair_ids:
+            partner_ids = [
+                oid for oid, (_, sig) in list(self._pending_orders.items())
+                if sig and sig.meta.get("pair_id") in cancelled_pair_ids
+            ]
+            for order_id in partner_ids:
+                try:
+                    self._client.cancel(order_id)
+                    cancelled += 1
+                    logger.info("Cancelled arb partner order", order_id=order_id)
+                except Exception as exc:
+                    logger.warning("Failed to cancel partner", order_id=order_id, error=str(exc))
+                finally:
+                    self._pending_orders.pop(order_id, None)
 
         return cancelled
 

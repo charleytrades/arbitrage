@@ -123,6 +123,14 @@ class Bot:
             await self._run_backtest()
             return
 
+        # Live mode safety gate
+        if self.mode == TradingMode.LIVE and not settings.live_confirmed:
+            logger.error(
+                "LIVE mode requires LIVE_CONFIRMED=true in .env. "
+                "This prevents accidental live trading."
+            )
+            return
+
         # Initialize executors
         await self._executor.initialize()
         if self._drift_executor:
@@ -282,7 +290,7 @@ class Bot:
                         )
 
                 # ── Resolve expired positions ───────────────────────
-                self._resolve_expired()
+                await self._resolve_expired()
 
                 # Tight loop – 50ms sleep to balance latency vs CPU
                 await asyncio.sleep(0.05)
@@ -293,98 +301,84 @@ class Bot:
                 logger.error("Strategy loop error", error=str(exc))
                 await asyncio.sleep(1.0)
 
-    def _resolve_expired(self) -> None:
+    async def _resolve_expired(self) -> None:
         """Check for expired markets and close positions.
 
-        Cross-outcome arb pairs are resolved together: one side wins ($1),
-        one loses ($0), net PnL = $1 - total_cost (always positive).
-
-        Momentum trades use Binance price to determine if direction was correct.
+        Paper/backtest: simulate outcomes (arb pairs always net positive,
+        momentum uses Binance price direction).
+        Live: query Gamma API for actual market resolution.
         """
         import random
 
         now = time.time()
 
-        # Group expired positions by market condition_id to detect arb pairs
+        # Group expired positions by market condition_id
         by_market: dict[str, list] = {}
         for pos in self._executor.get_open_positions():
             if pos.market.end_ts > now:
                 continue
-            if self.mode not in (TradingMode.PAPER_TRADE, TradingMode.BACKTEST):
-                continue
             by_market.setdefault(pos.market.condition_id, []).append(pos)
 
-        momentum_positions: list = []
+        if not by_market:
+            return
 
-        # Resolve cross-outcome arb pairs: markets with both YES and NO positions
         for cid, positions in by_market.items():
             has_yes = any(p.outcome == Outcome.YES for p in positions)
             has_no = any(p.outcome == Outcome.NO for p in positions)
 
-            if has_yes and has_no:
-                # Cross-outcome arb: one side wins, one loses, net = spread profit
+            # Determine winner
+            if self.mode == TradingMode.LIVE:
+                # Query Gamma for actual resolution
+                winner = await self._gamma.get_market_resolution(cid)
+                if winner is None:
+                    continue  # Not resolved yet, try next cycle
+                yes_won = winner.lower() == "yes"
+            elif has_yes and has_no:
+                # Paper arb pair: random pick, doesn't matter — net is always positive
                 yes_won = random.random() < 0.5
-                for pos in positions:
-                    if pos.outcome == Outcome.YES:
-                        exit_price = 1.0 if yes_won else 0.0
-                    else:
-                        exit_price = 0.0 if yes_won else 1.0
-                    pnl = self._executor.close_position(pos, exit_price)
-                    self._risk.record_trade(pnl)
-                    self._equity_curve.append(self._risk.state.bankroll)
-                    self._trade_log.append({
-                        "time": time.strftime("%H:%M:%S", time.gmtime(now)),
-                        "market": pos.market.slug,
-                        "signal_type": "cross_outcome_arb",
-                        "outcome": pos.outcome.value,
-                        "size": pos.size,
-                        "entry": pos.entry_price,
-                        "exit": exit_price,
-                        "pnl": pnl,
-                    })
             else:
-                # Single-side positions = momentum trades
-                momentum_positions.extend(positions)
-
-        # Resolve momentum trades: check if Binance price moved in predicted direction
-        for pos in momentum_positions:
-            symbol = pos.market.symbol
-            binance_window = self._momentum._binance_prices.get(symbol)
-            if binance_window and len(binance_window) >= 2:
-                price_at_entry = binance_window[0][1]
-                price_at_close = binance_window[-1][1]
-                moved_up = price_at_close > price_at_entry
-                if pos.outcome == Outcome.YES:
-                    won = moved_up
+                # Paper momentum: use Binance price direction
+                pos0 = positions[0]
+                symbol = pos0.market.symbol
+                binance_window = self._momentum._binance_prices.get(symbol)
+                if binance_window and len(binance_window) >= 2:
+                    moved_up = binance_window[-1][1] > binance_window[0][1]
+                    yes_won = moved_up
                 else:
-                    won = not moved_up
-            else:
-                won = random.random() < 0.5
-            exit_price = 1.0 if won else 0.0
-            pnl = self._executor.close_position(pos, exit_price)
-            self._risk.record_trade(pnl)
-            self._equity_curve.append(self._risk.state.bankroll)
-            self._trade_log.append({
-                "time": time.strftime("%H:%M:%S", time.gmtime(now)),
-                "market": pos.market.slug,
-                "signal_type": "momentum",
-                "outcome": pos.outcome.value,
-                "size": pos.size,
-                "entry": pos.entry_price,
-                "exit": exit_price,
-                "pnl": pnl,
-            })
+                    yes_won = random.random() < 0.5
 
-            # Send exit alert
-            asyncio.get_running_loop().create_task(
-                send_exit_alert(
-                    market_slug=pos.market.slug,
-                    outcome=pos.outcome.value,
-                    pnl=pnl,
-                    entry_price=pos.entry_price,
-                    exit_price=exit_price,
+            # Close all positions for this market
+            for pos in positions:
+                if pos.outcome == Outcome.YES:
+                    exit_price = 1.0 if yes_won else 0.0
+                else:
+                    exit_price = 0.0 if yes_won else 1.0
+
+                pnl = self._executor.close_position(pos, exit_price)
+                self._risk.record_trade(pnl)
+                self._equity_curve.append(self._risk.state.bankroll)
+
+                sig_type = "cross_outcome_arb" if (has_yes and has_no) else "momentum"
+                self._trade_log.append({
+                    "time": time.strftime("%H:%M:%S", time.gmtime(now)),
+                    "market": pos.market.slug,
+                    "signal_type": sig_type,
+                    "outcome": pos.outcome.value,
+                    "size": pos.size,
+                    "entry": pos.entry_price,
+                    "exit": exit_price,
+                    "pnl": pnl,
+                })
+
+                asyncio.get_running_loop().create_task(
+                    send_exit_alert(
+                        market_slug=pos.market.slug,
+                        outcome=pos.outcome.value,
+                        pnl=pnl,
+                        entry_price=pos.entry_price,
+                        exit_price=exit_price,
+                    )
                 )
-            )
 
         if len(self._trade_log) > 200:
             self._trade_log = self._trade_log[-100:]

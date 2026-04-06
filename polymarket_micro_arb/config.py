@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     trading_mode: Literal["backtest", "paper_trade", "live"] = Field(
         "paper_trade", alias="TRADING_MODE"
     )
+    live_confirmed: bool = Field(False, alias="LIVE_CONFIRMED")
 
     # ── Symbols ─────────────────────────────────────────────────────
     symbols: str = Field("BTCUSDT,ETHUSDT,SOLUSDT", alias="SYMBOLS")
