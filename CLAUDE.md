@@ -128,6 +128,18 @@ Enable with `DRIFT_ENABLED=true` in `.env`. Requires:
 
 The Drift client polls every 5s for active crypto prediction markets, matches them to Polymarket buckets by symbol + timeframe, and the cross-platform strategy scans for price discrepancies.
 
+## Standalone Predictor (`predictor/`)
+
+XGBoost-based crypto price direction predictor. Fully standalone from the arb bot.
+
+```bash
+python -m predictor fetch              # Download Binance klines
+python -m predictor train              # Walk-forward XGBoost training
+python -m predictor predict --once     # Single prediction pass
+python -m predictor backtest           # Evaluate on historical data
+streamlit run predictor_dashboard.py   # Prediction dashboard
+```
+
 ## Common Tasks
 
 **Check if bot is healthy:** `python scripts/health_check.py`
