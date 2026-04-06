@@ -27,10 +27,13 @@ from polymarket_micro_arb.constants import HEARTBEAT_INTERVAL_SEC, TradingMode
 from polymarket_micro_arb.data.binance_ws import BinanceWSClient, BybitWSClient
 from polymarket_micro_arb.data.gamma_client import GammaClient
 from polymarket_micro_arb.data.polymarket_ws import PolymarketWSClient
+from polymarket_micro_arb.data.drift_client import DriftBetClient
 from polymarket_micro_arb.execution.clob_executor import ClobExecutor
-from polymarket_micro_arb.models import BinanceTick, MarketInfo, Signal
+from polymarket_micro_arb.execution.drift_executor import DriftExecutor
+from polymarket_micro_arb.models import BinanceTick, MarketInfo, Signal, SignalType
 from polymarket_micro_arb.risk.risk_engine import RiskEngine
 from polymarket_micro_arb.strategy.cross_outcome_arb import CrossOutcomeArbStrategy
+from polymarket_micro_arb.strategy.cross_platform_arb import CrossPlatformArbStrategy
 from polymarket_micro_arb.strategy.momentum_latency import MomentumLatencyStrategy
 from polymarket_micro_arb.dashboard.state import StateWriter
 from polymarket_micro_arb.utils.backtester import Backtester, BacktestConfig
@@ -65,6 +68,16 @@ class Bot:
             bybit_prices=self._bybit_ws.latest_prices,
         )
         self._cross_arb = CrossOutcomeArbStrategy(self._polymarket_ws)
+
+        # ── Drift BET (cross-platform arb) ──────────────────────────
+        self._drift_enabled = settings.drift_enabled
+        self._drift_client = DriftBetClient() if self._drift_enabled else None
+        self._drift_executor = DriftExecutor() if self._drift_enabled else None
+        self._cross_platform_arb = (
+            CrossPlatformArbStrategy(self._polymarket_ws, self._drift_client)
+            if self._drift_enabled and self._drift_client
+            else None
+        )
 
         # ── Execution & risk ────────────────────────────────────────
         self._executor = ClobExecutor()
@@ -106,15 +119,27 @@ class Bot:
             await self._run_backtest()
             return
 
-        # Initialize executor (sets up EIP-712 creds in live mode)
+        # Initialize executors
         await self._executor.initialize()
+        if self._drift_executor:
+            await self._drift_executor.initialize()
 
         # Discover initial markets
+        logger.info("Discovering Polymarket micro-markets via Gamma API...")
         self._markets = await self._gamma.discover_current_markets()
         if not self._markets:
-            logger.warning("No markets discovered – will retry in refresh loop")
+            logger.warning(
+                "No markets discovered — this is normal if Polymarket doesn't "
+                "have active micro-bucket markets right now. Will retry every "
+                f"{settings.market_refresh_interval_sec}s."
+            )
 
         # Launch all tasks with structured concurrency
+        logger.info(
+            f"Launching task group — {len(self._markets)} markets, "
+            f"Binance WS + Bybit WS + Polymarket WS"
+            + (f" + Drift BET" if self._drift_client else "")
+        )
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self._binance_ws.start(), name="binance_ws")
@@ -125,6 +150,8 @@ class Bot:
                 tg.create_task(self._strategy_loop(), name="strategy_loop")
                 tg.create_task(self._market_refresh_loop(), name="market_refresh")
                 tg.create_task(self._order_management_loop(), name="order_mgmt")
+                if self._drift_client:
+                    tg.create_task(self._drift_client.start(), name="drift_bet")
                 tg.create_task(self._heartbeat_loop(), name="heartbeat")
                 tg.create_task(self._daily_summary_loop(), name="daily_summary")
                 tg.create_task(self._state_update_loop(), name="state_writer")
@@ -147,6 +174,7 @@ class Bot:
     async def _strategy_loop(self) -> None:
         """Core loop: consume ticks, evaluate strategies, execute trades."""
         logger.info("Strategy loop started")
+        _idle_logged = False
 
         while not self._shutdown_event.is_set():
             try:
@@ -161,8 +189,12 @@ class Bot:
                         break
 
                 if not self._markets:
+                    if not _idle_logged:
+                        logger.info("Strategy loop idle — no active markets. Waiting for market refresh.")
+                        _idle_logged = True
                     await asyncio.sleep(0.5)
                     continue
+                _idle_logged = False
 
                 # Keep Bybit prices reference up to date
                 self._momentum.set_bybit_prices(self._bybit_ws.latest_prices)
@@ -171,6 +203,12 @@ class Bot:
                 signals: list[Signal] = []
                 signals.extend(self._momentum.evaluate(self._markets))
                 signals.extend(self._cross_arb.evaluate(self._markets))
+
+                # Cross-platform arb (Polymarket vs Drift)
+                if self._cross_platform_arb:
+                    signals.extend(
+                        self._cross_platform_arb.evaluate(self._markets)
+                    )
 
                 # ── Track signals for dashboard ─────────────────────
                 for sig in signals:
@@ -196,11 +234,22 @@ class Bot:
                     if not allowed or size <= 0:
                         continue
 
-                    result = await self._executor.execute_signal(sig, size)
+                    # Route to correct executor based on platform
+                    buy_platform = sig.meta.get("buy_platform", "polymarket")
+                    if (
+                        buy_platform == "drift"
+                        and self._drift_executor
+                        and sig.signal_type == SignalType.CROSS_PLATFORM_ARB
+                    ):
+                        result = await self._drift_executor.execute_signal(sig, size)
+                    else:
+                        result = await self._executor.execute_signal(sig, size)
+
                     if result.success:
                         logger.info(
                             "Signal executed",
                             signal_type=sig.signal_type.value,
+                            platform=buy_platform,
                             market=sig.market.slug,
                             outcome=sig.outcome.value,
                             size=f"${size:.2f}",
@@ -344,11 +393,18 @@ class Bot:
                 hours = int(uptime // 3600)
                 minutes = int((uptime % 3600) // 60)
 
+                drift_markets = (
+                    len(self._drift_client.get_active_markets())
+                    if self._drift_client else 0
+                )
+
                 logger.info(
                     "HEARTBEAT",
                     uptime=f"{hours}h{minutes}m",
                     mode=self.mode.value,
                     active_markets=len([m for m in self._markets if m.active]),
+                    drift_markets=drift_markets,
+                    drift_enabled=self._drift_enabled,
                     binance_connected=self._binance_ws.is_connected,
                     tick_queue_size=self._tick_queue.qsize(),
                     **self._risk.stats,
@@ -503,6 +559,10 @@ class Bot:
         await self._bybit_ws.stop()
         await self._polymarket_ws.stop()
         await self._gamma.close()
+        if self._drift_client:
+            await self._drift_client.stop()
+        if self._drift_executor:
+            await self._drift_executor.close()
 
         # Final stats
         logger.info("Final risk stats", **self._risk.stats)
