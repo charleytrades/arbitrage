@@ -22,6 +22,12 @@ class Outcome(str, Enum):
 class SignalType(str, Enum):
     MOMENTUM_LATENCY = "momentum_latency"
     CROSS_OUTCOME_ARB = "cross_outcome_arb"
+    CROSS_PLATFORM_ARB = "cross_platform_arb"
+
+
+class Platform(str, Enum):
+    POLYMARKET = "polymarket"
+    DRIFT = "drift"
 
 
 # ── Market representation ───────────────────────────────────────────
@@ -133,6 +139,43 @@ class OrderResult(BaseModel):
     avg_price: float = 0.0
     error: str = ""
     timestamp: float = Field(default_factory=time.time)
+
+
+# ── Drift BET market ────────────────────────────────────────────────
+class DriftMarket(BaseModel):
+    """A Drift BET prediction market."""
+
+    market_index: int  # Drift's internal market index
+    question: str
+    symbol: str  # e.g. "BTC", "ETH", "SOL"
+    bucket: str  # "5m", "15m", etc.
+    start_ts: int
+    end_ts: int
+    yes_price: float = 0.5  # Current YES token price on Drift
+    no_price: float = 0.5
+    yes_liquidity: float = 0.0
+    no_liquidity: float = 0.0
+    active: bool = True
+    platform: Platform = Platform.DRIFT
+
+    @property
+    def seconds_remaining(self) -> float:
+        return max(0.0, self.end_ts - time.time())
+
+
+# ── Cross-platform pair ─────────────────────────────────────────────
+class CrossPlatformPair(BaseModel):
+    """A matched pair of markets across Polymarket and Drift."""
+
+    polymarket: MarketInfo
+    drift: DriftMarket
+    symbol: str
+    bucket: str
+    poly_yes_ask: float = 1.0
+    poly_no_ask: float = 1.0
+    drift_yes_ask: float = 1.0
+    drift_no_ask: float = 1.0
+    spread: float = 0.0  # Best cross-platform spread
 
 
 # ── Daily stats snapshot ────────────────────────────────────────────

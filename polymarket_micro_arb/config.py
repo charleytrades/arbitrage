@@ -83,6 +83,24 @@ class Settings(BaseSettings):
     max_order_size: float = Field(100.0, alias="MAX_ORDER_SIZE")
     order_ttl_sec: int = Field(60, alias="ORDER_TTL_SEC")
 
+    # ── Drift BET (cross-platform arb) ────────────────────────────
+    drift_enabled: bool = Field(False, alias="DRIFT_ENABLED")
+    drift_api_url: str = Field(
+        "https://drift-historical-data-v2.s3.eu-west-1.amazonaws.com",
+        alias="DRIFT_API_URL",
+    )
+    drift_mainnet_rpc: str = Field(
+        "https://api.mainnet-beta.solana.com", alias="DRIFT_MAINNET_RPC"
+    )
+    drift_bet_api_url: str = Field(
+        "https://bet.drift.trade/api", alias="DRIFT_BET_API_URL"
+    )
+    solana_private_key: str = Field("", alias="SOLANA_PRIVATE_KEY")
+    cross_platform_min_spread: float = Field(
+        0.06, alias="CROSS_PLATFORM_MIN_SPREAD"
+    )
+    drift_poll_interval_sec: int = Field(5, alias="DRIFT_POLL_INTERVAL_SEC")
+
     # ── Market discovery ────────────────────────────────────────────
     market_refresh_interval_sec: int = Field(30, alias="MARKET_REFRESH_INTERVAL_SEC")
 
