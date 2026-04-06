@@ -1,8 +1,18 @@
 """Drift BET order executor.
 
-Places orders on Drift BET prediction markets via their API.
+Places orders on Drift BET prediction markets.
 In paper_trade mode, simulates fills. In live mode, posts real
-orders using the Solana keypair.
+orders via the Drift Gateway REST API (self-hosted).
+
+Drift BET markets are perp markets with binary YES/NO outcomes:
+  - Long (positive amount) = YES
+  - Short (negative amount) = NO
+  - Price range: 0 to 1 USDC per share
+  - Settlement: winning side → $1, losing side → $0
+
+Live trading requires the Drift Gateway running locally:
+  docker run -e DRIFT_GATEWAY_KEY=<base58_key> -p 8080:8080 \
+    ghcr.io/drift-labs/gateway https://api.mainnet-beta.solana.com
 
 This is the second execution leg for cross-platform arb —
 when the strategy identifies a cheaper price on Drift, the
@@ -28,32 +38,57 @@ from polymarket_micro_arb.models import (
 from polymarket_micro_arb.utils.logger import logger
 from polymarket_micro_arb.utils.telegram_alerts import send_trade_alert
 
+# Default gateway URL (self-hosted Drift Gateway)
+DRIFT_GATEWAY_URL = "http://localhost:8080"
+
 
 class DriftExecutor:
     """Handles order placement on Drift BET.
 
     In paper_trade mode: simulates fills at the quoted price.
-    In live mode: posts orders via Drift BET REST API using Solana keypair.
+    In live mode: posts orders via Drift Gateway REST API.
+
+    The Gateway handles Solana transaction signing and submission.
+    See: https://github.com/drift-labs/gateway
     """
 
     def __init__(self) -> None:
         self.mode = TradingMode(settings.trading_mode)
-        self.api_url = settings.drift_bet_api_url.rstrip("/")
+        self.gateway_url = getattr(settings, "drift_gateway_url", DRIFT_GATEWAY_URL)
         self._session: aiohttp.ClientSession | None = None
         self.open_positions: list[Position] = []
         self.closed_positions: list[Position] = []
         self._order_count = 0
 
     async def initialize(self) -> None:
-        """Set up the Drift API session."""
+        """Set up the Drift Gateway session for live trading."""
         if self.mode == TradingMode.LIVE:
             if not settings.solana_private_key:
                 logger.warning("SOLANA_PRIVATE_KEY not set — Drift live trading disabled")
                 return
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=30)
             )
-            logger.info("Drift executor initialized", mode="live")
+            # Verify gateway is reachable
+            try:
+                async with self._session.get(f"{self.gateway_url}/v2/positions") as resp:
+                    if resp.status == 200:
+                        logger.info(
+                            "Drift Gateway connected",
+                            gateway=self.gateway_url,
+                            mode="live",
+                        )
+                    else:
+                        logger.warning(
+                            "Drift Gateway returned non-200 — check gateway is running",
+                            status=resp.status,
+                        )
+            except aiohttp.ClientError as exc:
+                logger.warning(
+                    "Drift Gateway unreachable — live orders will fail",
+                    gateway=self.gateway_url,
+                    error=str(exc),
+                )
         else:
             logger.info("Drift executor initialized", mode=self.mode.value)
 
@@ -64,39 +99,52 @@ class DriftExecutor:
         return await self._execute_paper(signal, size)
 
     async def _execute_live(self, signal: Signal, size: float) -> OrderResult:
-        """Place a real order on Drift BET via API."""
+        """Place a real order on Drift BET via Gateway REST API.
+
+        Gateway endpoint: POST /v2/orders
+        Positive amount = Long (YES), Negative amount = Short (NO)
+        """
         if not self._session:
             return OrderResult(success=False, error="Drift session not initialized")
 
         market_index = signal.meta.get("drift_market_index", 0)
-        outcome = "yes" if signal.outcome == Outcome.YES else "no"
+
+        # Long = YES, Short = NO
+        # Positive amount = buying YES, Negative = buying NO
+        if signal.outcome == Outcome.YES:
+            amount = size  # Positive = Long/YES
+        else:
+            amount = -size  # Negative = Short/NO
 
         try:
-            # Drift BET API order placement
-            # The exact endpoint depends on Drift's API — this is the expected pattern
-            url = f"{self.api_url}/orders"
+            url = f"{self.gateway_url}/v2/orders"
             payload = {
-                "marketIndex": market_index,
-                "side": outcome,
-                "amount": size,
-                "price": signal.limit_price,
-                "type": "limit",
+                "orders": [{
+                    "marketIndex": market_index,
+                    "marketType": "perp",
+                    "amount": amount,
+                    "price": signal.limit_price,
+                    "orderType": "limit",
+                    "postOnly": True,
+                }]
             }
 
-            # Add auth header with Solana signature
-            headers = await self._sign_request(payload)
-
-            async with self._session.post(url, json=payload, headers=headers) as resp:
+            async with self._session.post(url, json=payload) as resp:
                 data = await resp.json()
 
                 if resp.status in (200, 201):
-                    order_id = str(data.get("orderId", data.get("id", "")))
+                    # Gateway returns order confirmation
+                    order_id = str(data.get("orderId", data.get("ids", [""])[0] if isinstance(data.get("ids"), list) else ""))
+                    if not order_id:
+                        order_id = f"drift_live_{self._order_count + 1}"
+
                     result = OrderResult(
                         success=True,
                         order_id=f"drift_{order_id}",
                         filled_size=size,
                         avg_price=signal.limit_price,
                     )
+                    self._order_count += 1
                     self._track_position(signal, size, signal.limit_price, result.order_id)
 
                     await send_trade_alert(
@@ -109,16 +157,17 @@ class DriftExecutor:
                         edge=signal.edge,
                     )
                     logger.info(
-                        "Drift live order placed",
+                        "Drift live order placed via Gateway",
                         order_id=result.order_id,
                         market_index=market_index,
-                        outcome=outcome,
-                        size=size,
+                        outcome=signal.outcome.value,
+                        amount=amount,
+                        price=signal.limit_price,
                     )
                     return result
                 else:
                     error = str(data)
-                    logger.error("Drift order rejected", error=error)
+                    logger.error("Drift Gateway order rejected", error=error, status=resp.status)
                     return OrderResult(success=False, error=error)
 
         except Exception as exc:
@@ -163,22 +212,6 @@ class DriftExecutor:
         )
 
         return result
-
-    async def _sign_request(self, payload: dict) -> dict:
-        """Sign a request with the Solana private key.
-
-        In production, this would use solders or solana-py to create
-        an Ed25519 signature. For now, returns the key as a header.
-        Full Solana signing requires the solders package.
-        """
-        # Placeholder — real implementation needs:
-        # from solders.keypair import Keypair
-        # keypair = Keypair.from_base58_string(settings.solana_private_key)
-        # signature = keypair.sign_message(message_bytes)
-        return {
-            "Authorization": f"Bearer {settings.solana_private_key[:16]}...",
-            "Content-Type": "application/json",
-        }
 
     def _track_position(
         self, signal: Signal, size: float, price: float, order_id: str

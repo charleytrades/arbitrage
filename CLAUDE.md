@@ -98,9 +98,21 @@ python scripts/daily_report.py
 ## Drift BET Integration
 
 Enable with `DRIFT_ENABLED=true` in `.env`. Requires:
-- `SOLANA_PRIVATE_KEY` — Solana keypair for live Drift trading
-- `DRIFT_BET_API_URL` — Drift BET API endpoint
+- `SOLANA_PRIVATE_KEY` — Solana keypair (base58) for live Drift trading
+- `DRIFT_GATEWAY_URL` — Self-hosted Drift Gateway for live orders (default `http://localhost:8080`)
 - `CROSS_PLATFORM_MIN_SPREAD` — Minimum spread to trigger cross-platform arb (default 6%)
+
+**Architecture:**
+- Data reads use Drift's public APIs (no auth needed):
+  - Market discovery: `https://data.api.drift.trade/stats/markets`
+  - L2 orderbook: `https://dlob.drift.trade/l2?marketIndex=N&marketType=perp`
+- Order execution uses Drift Gateway (self-hosted Rust binary/Docker):
+  ```bash
+  docker run -e DRIFT_GATEWAY_KEY=<base58_seed> -p 8080:8080 \
+    ghcr.io/drift-labs/gateway https://api.mainnet-beta.solana.com
+  ```
+- BET markets are perp markets with `-BET` suffix. Long=YES, Short=NO.
+- Paper trade mode works without Gateway — simulates fills locally.
 
 The Drift client polls every 5s for active crypto prediction markets, matches them to Polymarket buckets by symbol + timeframe, and the cross-platform strategy scans for price discrepancies.
 

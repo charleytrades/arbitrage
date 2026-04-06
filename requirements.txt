@@ -10,3 +10,4 @@ pandas>=2.1.0
 numpy>=1.26.0
 httpx>=0.25.0
 streamlit>=1.31.0
+driftpy>=0.8.89

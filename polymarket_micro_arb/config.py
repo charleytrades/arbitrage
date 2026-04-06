@@ -85,15 +85,14 @@ class Settings(BaseSettings):
 
     # ── Drift BET (cross-platform arb) ────────────────────────────
     drift_enabled: bool = Field(False, alias="DRIFT_ENABLED")
-    drift_api_url: str = Field(
-        "https://drift-historical-data-v2.s3.eu-west-1.amazonaws.com",
-        alias="DRIFT_API_URL",
-    )
     drift_mainnet_rpc: str = Field(
         "https://api.mainnet-beta.solana.com", alias="DRIFT_MAINNET_RPC"
     )
     drift_bet_api_url: str = Field(
-        "https://bet.drift.trade/api", alias="DRIFT_BET_API_URL"
+        "https://data.api.drift.trade", alias="DRIFT_BET_API_URL"
+    )
+    drift_gateway_url: str = Field(
+        "http://localhost:8080", alias="DRIFT_GATEWAY_URL"
     )
     solana_private_key: str = Field("", alias="SOLANA_PRIVATE_KEY")
     cross_platform_min_spread: float = Field(
