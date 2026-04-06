@@ -32,7 +32,7 @@ from polymarket_micro_arb.data.polymarket_ws import PolymarketWSClient
 from polymarket_micro_arb.data.drift_client import DriftBetClient
 from polymarket_micro_arb.execution.clob_executor import ClobExecutor
 from polymarket_micro_arb.execution.drift_executor import DriftExecutor
-from polymarket_micro_arb.models import BinanceTick, MarketInfo, Signal, SignalType
+from polymarket_micro_arb.models import BinanceTick, MarketInfo, Outcome, Signal, SignalType
 from polymarket_micro_arb.risk.risk_engine import RiskEngine
 from polymarket_micro_arb.strategy.cross_outcome_arb import CrossOutcomeArbStrategy
 from polymarket_micro_arb.strategy.cross_platform_arb import CrossPlatformArbStrategy
@@ -143,7 +143,6 @@ class Bot:
             f"Launching task group — {len(self._markets)} markets, "
             f"Binance WS + Bybit WS + Polymarket WS"
             + (f" + Drift BET" if self._drift_client else "")
-            + (f" + Broad scanner" if settings.broad_scan_enabled else "")
         )
         try:
             async with asyncio.TaskGroup() as tg:
@@ -157,13 +156,11 @@ class Bot:
                 tg.create_task(self._order_management_loop(), name="order_mgmt")
                 if self._drift_client:
                     tg.create_task(self._drift_client.start(), name="drift_bet")
+                if settings.broad_scan_enabled:
+                    tg.create_task(self._broad_market_refresh_loop(), name="broad_scan")
                 tg.create_task(self._heartbeat_loop(), name="heartbeat")
                 tg.create_task(self._daily_summary_loop(), name="daily_summary")
                 tg.create_task(self._state_update_loop(), name="state_writer")
-                if settings.broad_scan_enabled:
-                    tg.create_task(
-                        self._broad_market_refresh_loop(), name="broad_scan"
-                    )
                 tg.create_task(self._wait_for_shutdown(), name="shutdown_watcher")
         except* Exception as eg:
             # TaskGroup catches all exceptions from child tasks
@@ -171,13 +168,27 @@ class Bot:
                 if not isinstance(exc, asyncio.CancelledError):
                     logger.error("Task failed", error=str(exc))
 
-        # Graceful shutdown
-        await self._shutdown()
+        # Graceful shutdown with timeout — don't let cleanup hang forever
+        try:
+            await asyncio.wait_for(self._shutdown(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("Shutdown timed out after 10s — forcing exit")
 
     async def _wait_for_shutdown(self) -> None:
-        """Wait for the shutdown event, then cancel the TaskGroup."""
+        """Wait for the shutdown event, then abort connections and exit."""
         await self._shutdown_event.wait()
-        # Raising CancelledError propagates to TaskGroup and cancels siblings
+        logger.info("Shutdown event received — aborting connections")
+        # Abort WS transports immediately (no close handshake).
+        # websockets v16 close() does a handshake that can hang forever;
+        # transport.abort() drops the TCP connection instantly.
+        for ws_client in (self._binance_ws, self._bybit_ws):
+            if ws_client._ws is not None:
+                try:
+                    ws_client._ws.transport.abort()
+                except Exception:
+                    pass
+        # Brief yield so the WS loops see _running=False and exit
+        await asyncio.sleep(0.5)
         raise asyncio.CancelledError("Shutdown requested")
 
     async def _strategy_loop(self) -> None:
@@ -285,47 +296,84 @@ class Bot:
     def _resolve_expired(self) -> None:
         """Check for expired markets and close positions.
 
-        In production, this would query Gamma API for resolution.
-        For paper trading, we use a simple heuristic based on whether
-        the Binance price moved in the predicted direction.
+        Cross-outcome arb pairs are resolved together: one side wins ($1),
+        one loses ($0), net PnL = $1 - total_cost (always positive).
+
+        Momentum trades use Binance price to determine if direction was correct.
         """
+        import random
+
         now = time.time()
+
+        # Group expired positions by market condition_id to detect arb pairs
+        by_market: dict[str, list] = {}
         for pos in self._executor.get_open_positions():
             if pos.market.end_ts > now:
-                continue  # Not expired yet
-
-            # For paper/backtest: determine win based on the latest Binance price
-            # In live mode, query Gamma API for actual resolution
-            if self.mode in (TradingMode.PAPER_TRADE, TradingMode.BACKTEST):
-                # Simple heuristic: check if our directional bet was correct
-                # We stored the move direction in the signal meta
-                # Default to 50/50 if we can't determine
-                import random
-
-                won = random.random() < pos.entry_price  # Higher confidence = more likely right
-                exit_price = 1.0 if won else 0.0
-            else:
-                # Live: would poll Gamma for resolution
-                # For now, skip – resolution polling is in the market refresh loop
                 continue
+            if self.mode not in (TradingMode.PAPER_TRADE, TradingMode.BACKTEST):
+                continue
+            by_market.setdefault(pos.market.condition_id, []).append(pos)
 
+        momentum_positions: list = []
+
+        # Resolve cross-outcome arb pairs: markets with both YES and NO positions
+        for cid, positions in by_market.items():
+            has_yes = any(p.outcome == Outcome.YES for p in positions)
+            has_no = any(p.outcome == Outcome.NO for p in positions)
+
+            if has_yes and has_no:
+                # Cross-outcome arb: one side wins, one loses, net = spread profit
+                yes_won = random.random() < 0.5
+                for pos in positions:
+                    if pos.outcome == Outcome.YES:
+                        exit_price = 1.0 if yes_won else 0.0
+                    else:
+                        exit_price = 0.0 if yes_won else 1.0
+                    pnl = self._executor.close_position(pos, exit_price)
+                    self._risk.record_trade(pnl)
+                    self._equity_curve.append(self._risk.state.bankroll)
+                    self._trade_log.append({
+                        "time": time.strftime("%H:%M:%S", time.gmtime(now)),
+                        "market": pos.market.slug,
+                        "signal_type": "cross_outcome_arb",
+                        "outcome": pos.outcome.value,
+                        "size": pos.size,
+                        "entry": pos.entry_price,
+                        "exit": exit_price,
+                        "pnl": pnl,
+                    })
+            else:
+                # Single-side positions = momentum trades
+                momentum_positions.extend(positions)
+
+        # Resolve momentum trades: check if Binance price moved in predicted direction
+        for pos in momentum_positions:
+            symbol = pos.market.symbol
+            binance_window = self._momentum._binance_prices.get(symbol)
+            if binance_window and len(binance_window) >= 2:
+                price_at_entry = binance_window[0][1]
+                price_at_close = binance_window[-1][1]
+                moved_up = price_at_close > price_at_entry
+                if pos.outcome == Outcome.YES:
+                    won = moved_up
+                else:
+                    won = not moved_up
+            else:
+                won = random.random() < 0.5
+            exit_price = 1.0 if won else 0.0
             pnl = self._executor.close_position(pos, exit_price)
             self._risk.record_trade(pnl)
-
-            # Track for dashboard
             self._equity_curve.append(self._risk.state.bankroll)
             self._trade_log.append({
                 "time": time.strftime("%H:%M:%S", time.gmtime(now)),
                 "market": pos.market.slug,
-                "signal_type": "resolution",
+                "signal_type": "momentum",
                 "outcome": pos.outcome.value,
                 "size": pos.size,
                 "entry": pos.entry_price,
                 "exit": exit_price,
                 "pnl": pnl,
             })
-            if len(self._trade_log) > 200:
-                self._trade_log = self._trade_log[-100:]
 
             # Send exit alert
             asyncio.get_running_loop().create_task(
@@ -337,6 +385,9 @@ class Bot:
                     exit_price=exit_price,
                 )
             )
+
+        if len(self._trade_log) > 200:
+            self._trade_log = self._trade_log[-100:]
 
     async def _market_refresh_loop(self) -> None:
         """Discover new markets every 30s for fresh bucket windows."""
@@ -490,7 +541,6 @@ class Bot:
                     drift_markets=drift_markets,
                     drift_enabled=self._drift_enabled,
                     binance_connected=self._binance_ws.is_connected,
-                    polymarket_books=len(self._polymarket_ws.books),
                     tick_queue_size=self._tick_queue.qsize(),
                     **self._risk.stats,
                     **self._executor.position_stats,
@@ -625,33 +675,30 @@ class Bot:
 
     def _install_signal_handlers(self) -> None:
         """Register SIGTERM/SIGINT handlers for graceful shutdown."""
-        self._signal_count = 0
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self._handle_signal, sig)
 
     def _handle_signal(self, sig: signal.Signals) -> None:
-        self._signal_count += 1
-        if self._signal_count >= 2:
-            logger.info("Second signal received — hard exit")
+        if self._shutdown_event.is_set():
+            # Second signal — force exit immediately
+            logger.warning("Forced shutdown (second signal)", signal=sig.name)
             os._exit(1)
-
         logger.info("Received signal — shutting down", signal=sig.name)
-        # Stop WS clients immediately so their close() doesn't block
+        # Stop all WS loops immediately so they don't reconnect
         self._binance_ws._running = False
         self._bybit_ws._running = False
         self._polymarket_ws._running = False
         self._shutdown_event.set()
+        # Watchdog thread: if graceful shutdown takes >5s, force exit.
+        # Must be a thread because the event loop may be blocked.
+        threading.Thread(target=self._force_exit, daemon=True).start()
 
-        # Watchdog thread: if async shutdown hangs (websockets v16 close
-        # handshake deadlock), force-exit after 5s.  Works because threads
-        # fire even when the event loop is blocked.
-        def _force_exit():
-            time.sleep(5)
-            logger.info("Shutdown watchdog fired — forcing exit")
-            os._exit(0)
-
-        threading.Thread(target=_force_exit, daemon=True).start()
+    @staticmethod
+    def _force_exit() -> None:
+        time.sleep(5)
+        logger.warning("Graceful shutdown timed out after 5s — forcing exit")
+        os._exit(0)
 
     async def _shutdown(self) -> None:
         """Gracefully shut down all components."""

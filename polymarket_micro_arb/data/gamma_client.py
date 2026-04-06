@@ -171,6 +171,7 @@ class GammaClient:
                     if len(data) < page_size:
                         break
                     offset += page_size
+                    await asyncio.sleep(0.2)  # Rate limit API requests
 
             except (aiohttp.ClientError, Exception) as exc:
                 logger.warning("Broad scan error", offset=offset, error=str(exc))
