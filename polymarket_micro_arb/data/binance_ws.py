@@ -155,7 +155,16 @@ class BinanceWSClient:
 
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and self._ws.open
+        if self._ws is None:
+            return False
+        # websockets v16+: no .open attribute, use .state
+        try:
+            return self._ws.state.name == "OPEN"
+        except AttributeError:
+            try:
+                return self._ws.open
+            except AttributeError:
+                return False
 
 
 class BybitWSClient:

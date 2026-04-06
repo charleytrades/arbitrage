@@ -107,6 +107,12 @@ class MomentumLatencyStrategy:
             # Need sufficient Binance tick data
             binance_window = self._binance_prices.get(market.symbol)
             if not binance_window or len(binance_window) < 10:
+                logger.debug(
+                    "GUARD:TICKS insufficient",
+                    market=market.slug,
+                    ticks=len(binance_window) if binance_window else 0,
+                    age=f"{age:.1f}s",
+                )
                 continue
 
             # ── Compute momentum from Binance only ──────────────────
@@ -116,6 +122,12 @@ class MomentumLatencyStrategy:
                 (ts, p) for ts, p in binance_window if ts >= bucket_start
             ]
             if len(recent) < 5:
+                logger.debug(
+                    "GUARD:BUCKET_TICKS insufficient",
+                    market=market.slug,
+                    bucket_ticks=len(recent),
+                    age=f"{age:.1f}s",
+                )
                 continue
 
             price_at_open = recent[0][1]

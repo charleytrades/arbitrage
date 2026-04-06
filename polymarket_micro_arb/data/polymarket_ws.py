@@ -86,7 +86,16 @@ class PolymarketWSClient:
 
     async def update_subscriptions(self, markets: list[MarketInfo]) -> None:
         """Dynamically add subscriptions for newly discovered markets."""
-        if self._ws and self._ws.open:
+        ws_open = False
+        if self._ws:
+            try:
+                ws_open = self._ws.state.name == "OPEN"
+            except AttributeError:
+                try:
+                    ws_open = self._ws.open
+                except AttributeError:
+                    ws_open = False
+        if ws_open:
             await self._subscribe_markets(self._ws, markets)
 
     async def _consume(self, ws: websockets.WebSocketClientProtocol) -> None:
