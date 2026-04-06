@@ -58,8 +58,10 @@ class PolymarketWSClient:
                     await self._consume(ws)
 
             except ConnectionClosed as exc:
+                self._subscribed.clear()  # Force re-subscribe on reconnect
                 logger.warning("Polymarket WS closed", code=exc.code, reason=exc.reason)
             except Exception as exc:
+                self._subscribed.clear()  # Force re-subscribe on reconnect
                 logger.error("Polymarket WS error", error=str(exc))
 
             if self._running:
@@ -102,16 +104,7 @@ class PolymarketWSClient:
 
         Used by the broad scanner which may add hundreds of markets at once.
         """
-        ws_open = False
-        if self._ws:
-            try:
-                ws_open = self._ws.state.name == "OPEN"
-            except AttributeError:
-                try:
-                    ws_open = self._ws.open
-                except AttributeError:
-                    ws_open = False
-        if not ws_open:
+        if not self.is_connected:
             return
 
         new_markets = [m for m in markets if m.condition_id not in self._subscribed]
