@@ -69,7 +69,9 @@ class CrossOutcomeArbStrategy:
                 continue
 
             total_cost = yes_ask + no_ask
-            profit = 1.0 - total_cost  # Guaranteed profit per $1 of each side
+            # Fee is 10% (1000 bps) on each leg's cost
+            total_fee = (yes_ask + no_ask) * 0.10
+            profit = 1.0 - total_cost - total_fee
 
             if total_cost < self.threshold and profit > self.min_profit:
                 self._last_signal_ts[market.condition_id] = now
@@ -86,12 +88,13 @@ class CrossOutcomeArbStrategy:
                     continue
 
                 logger.info(
-                    "CROSS-OUTCOME ARB: YES+NO < $0.99",
+                    "CROSS-OUTCOME ARB (fee-adjusted)",
                     market=market.slug,
                     yes_ask=f"{yes_ask:.4f}",
                     no_ask=f"{no_ask:.4f}",
                     total_cost=f"{total_cost:.4f}",
-                    profit_per_unit=f"{profit:.4f}",
+                    fee=f"{total_fee:.4f}",
+                    net_profit=f"{profit:.4f}",
                     available_shares=f"{max_shares:.2f}",
                 )
 

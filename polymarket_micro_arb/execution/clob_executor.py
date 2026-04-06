@@ -15,7 +15,7 @@ import asyncio
 import time
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OrderArgs, OrderType
 
 from polymarket_micro_arb.config import settings
 from polymarket_micro_arb.constants import TradingMode
@@ -60,6 +60,35 @@ class ClobExecutor:
             logger.info("CLOB client initialized (EIP-712)", mode="live")
         else:
             logger.info("CLOB executor initialized", mode=self.mode.value)
+
+    def get_usdc_balance(self) -> float | None:
+        """Query USDC.e balance from the CLOB API. Returns dollars or None."""
+        if not self._client:
+            return None
+        try:
+            resp = self._client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            # Balance is in 6-decimal USDC units
+            raw = float(resp.get("balance", 0))
+            return raw / 1e6
+        except Exception as exc:
+            logger.warning("Failed to query balance", error=str(exc))
+            return None
+
+    def set_allowance(self) -> bool:
+        """Approve Polymarket contracts to spend USDC.e. One-time setup."""
+        if not self._client:
+            return False
+        try:
+            self._client.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            logger.info("USDC.e allowance set for Polymarket contracts")
+            return True
+        except Exception as exc:
+            logger.error("Failed to set allowance", error=str(exc))
+            return False
 
     async def execute_signal(self, signal: Signal, size: float) -> OrderResult:
         """Execute a trading signal. Routes to live or paper execution."""
@@ -163,16 +192,19 @@ class ClobExecutor:
                 fill_price = 0.5
 
         fill_price = float(max(0.01, min(0.99, fill_price)))
+        # Model the 10% Polymarket fee in paper mode so P&L matches live
+        fee = fill_price * 0.10
+        effective_price = min(0.99, fill_price + fee)
         order_id = f"paper_{self._order_count}"
 
         result = OrderResult(
             success=True,
             order_id=order_id,
             filled_size=size,
-            avg_price=fill_price,
+            avg_price=effective_price,
         )
 
-        self._track_position(signal, size, fill_price, order_id)
+        self._track_position(signal, size, effective_price, order_id)
 
         logger.info(
             "Paper limit order filled",

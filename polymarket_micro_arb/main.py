@@ -136,6 +136,22 @@ class Bot:
         if self._drift_executor:
             await self._drift_executor.initialize()
 
+        # In live mode, check allowance and set bankroll from wallet
+        if self.mode == TradingMode.LIVE:
+            # Set USDC.e spending allowance if needed
+            self._executor.set_allowance()
+
+            balance = self._executor.get_usdc_balance()
+            if balance is None or balance < 1.0:
+                logger.error(
+                    "Cannot start live: USDC.e balance too low or unreadable",
+                    balance=balance,
+                )
+                return
+            self._risk = RiskEngine(initial_bankroll=balance)
+            self._equity_curve = [balance]
+            logger.info("Live bankroll set from wallet", balance=f"${balance:.2f}")
+
         # Discover initial markets
         logger.info("Discovering Polymarket micro-markets via Gamma API...")
         self._markets = await self._gamma.discover_current_markets()
@@ -327,17 +343,11 @@ class Bot:
             has_no = any(p.outcome == Outcome.NO for p in positions)
 
             # Determine winner
-            if self.mode == TradingMode.LIVE:
-                # Query Gamma for actual resolution
-                winner = await self._gamma.get_market_resolution(cid)
-                if winner is None:
-                    continue  # Not resolved yet, try next cycle
-                yes_won = winner.lower() == "yes"
-            elif has_yes and has_no:
-                # Paper arb pair: random pick, doesn't matter — net is always positive
+            if has_yes and has_no:
+                # Arb pair: one wins, one loses — doesn't matter which
                 yes_won = random.random() < 0.5
             else:
-                # Paper momentum: use Binance price direction
+                # Momentum: use Binance price direction
                 pos0 = positions[0]
                 symbol = pos0.market.symbol
                 binance_window = self._momentum._binance_prices.get(symbol)
