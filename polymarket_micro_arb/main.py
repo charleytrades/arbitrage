@@ -246,9 +246,7 @@ class Bot:
                 # ── Evaluate strategies ─────────────────────────────
                 signals: list[Signal] = []
                 signals.extend(self._momentum.evaluate(self._markets))
-                # Cross-outcome arb scans micro-buckets + all broad markets
-                all_arb_markets = self._markets + self._broad_markets
-                signals.extend(self._cross_arb.evaluate(all_arb_markets))
+                # Cross-outcome arb disabled: 10% Polymarket fee kills all arb spreads
 
                 # Cross-platform arb (Polymarket vs Drift)
                 if self._cross_platform_arb:

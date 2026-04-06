@@ -224,7 +224,7 @@ class MomentumLatencyStrategy:
                 move_strength = abs(pct_change) / self.momentum_threshold
                 implied_fair = min(0.95, 0.5 + (move_strength - 1.0) * 0.15 + 0.15)
                 if going_up:
-                    edge = implied_fair - yes_ask
+                    edge = implied_fair - yes_ask - (yes_ask * 0.10)
                     logger.info(
                         "FILTER:EDGE too small (UP)",
                         market=market.slug,
@@ -235,7 +235,7 @@ class MomentumLatencyStrategy:
                         verdict="Polymarket already repriced" if edge <= 0 else "edge below min_spread_profit",
                     )
                 else:
-                    edge = implied_fair - no_ask
+                    edge = implied_fair - no_ask - (no_ask * 0.10)
                     logger.info(
                         "FILTER:EDGE too small (DOWN)",
                         market=market.slug,
@@ -270,7 +270,8 @@ class MomentumLatencyStrategy:
             # Sigmoid-like mapping: strong move → high probability
             move_strength = abs(pct_change) / self.momentum_threshold
             implied_yes_fair = min(0.95, 0.5 + (move_strength - 1.0) * 0.15 + 0.15)
-            edge = implied_yes_fair - yes_ask
+            fee = yes_ask * 0.10  # 10% Polymarket taker fee
+            edge = implied_yes_fair - yes_ask - fee
 
             if edge > settings.min_spread_profit and 0.01 < yes_ask < implied_yes_fair:
                 # Confidence is high because we have multi-venue + volume confirmation
@@ -308,7 +309,8 @@ class MomentumLatencyStrategy:
             # Price going down → NO should be worth more
             move_strength = abs(pct_change) / self.momentum_threshold
             implied_no_fair = min(0.95, 0.5 + (move_strength - 1.0) * 0.15 + 0.15)
-            edge = implied_no_fair - no_ask
+            fee = no_ask * 0.10  # 10% Polymarket taker fee
+            edge = implied_no_fair - no_ask - fee
 
             if edge > settings.min_spread_profit and 0.01 < no_ask < implied_no_fair:
                 confidence = min(0.98, 0.85 + move_strength * 0.04)
