@@ -84,6 +84,39 @@ class PolymarketWSClient:
 
             self._subscribed.add(market.condition_id)
 
+    async def subscribe_batch(
+        self, markets: list[MarketInfo], chunk_size: int = 50
+    ) -> None:
+        """Subscribe to many markets in chunks to avoid overwhelming the WS.
+
+        Used by the broad scanner which may add hundreds of markets at once.
+        """
+        ws_open = False
+        if self._ws:
+            try:
+                ws_open = self._ws.state.name == "OPEN"
+            except AttributeError:
+                try:
+                    ws_open = self._ws.open
+                except AttributeError:
+                    ws_open = False
+        if not ws_open:
+            return
+
+        new_markets = [m for m in markets if m.condition_id not in self._subscribed]
+        for i in range(0, len(new_markets), chunk_size):
+            chunk = new_markets[i : i + chunk_size]
+            await self._subscribe_markets(self._ws, chunk)
+            if i + chunk_size < len(new_markets):
+                await asyncio.sleep(0.1)  # Brief pause between chunks
+
+        if new_markets:
+            logger.info(
+                "Batch subscribed to broad markets",
+                count=len(new_markets),
+                total_books=len(self.books),
+            )
+
     async def update_subscriptions(self, markets: list[MarketInfo]) -> None:
         """Dynamically add subscriptions for newly discovered markets."""
         ws_open = False
