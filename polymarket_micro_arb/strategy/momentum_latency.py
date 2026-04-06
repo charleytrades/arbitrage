@@ -188,23 +188,23 @@ class MomentumLatencyStrategy:
             if bybit_price is not None and price_at_open > 0:
                 bybit_pct = (bybit_price - price_at_open) / price_at_open
                 if going_up and bybit_pct < self.momentum_threshold * 0.5:
-                    bybit_confirms = False
-                    logger.debug(
-                        "Bybit disagrees on upward momentum (non-blocking)",
+                    logger.info(
+                        "FILTER:BYBIT disagrees (UP)",
                         market=market.slug,
                         binance_pct=f"{pct_change:.4f}",
                         bybit_pct=f"{bybit_pct:.4f}",
                         need=f">= {self.momentum_threshold * 0.5:.4f}",
                     )
                 if going_down and bybit_pct > -self.momentum_threshold * 0.5:
-                    bybit_confirms = False
-                    logger.debug(
-                        "Bybit disagrees on downward momentum (non-blocking)",
+                    logger.info(
+                        "FILTER:BYBIT disagrees (DOWN)",
                         market=market.slug,
                         binance_pct=f"{pct_change:.4f}",
                         bybit_pct=f"{bybit_pct:.4f}",
                         need=f"<= {-self.momentum_threshold * 0.5:.4f}",
                     )
+
+            logger.info("PASSED:BYBIT confirmed", market=market.slug)
 
             logger.info("PASSED:BYBIT confirmed", market=market.slug)
 

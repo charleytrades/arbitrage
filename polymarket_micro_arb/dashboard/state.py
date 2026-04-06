@@ -47,6 +47,7 @@ class StateWriter:
         pause_reason: str = "",
         # Markets
         active_markets: list[dict] = [],
+        broad_markets: int = 0,
         # Positions
         open_positions: list[dict] = [],
         closed_positions: list[dict] = [],
@@ -87,6 +88,7 @@ class StateWriter:
             },
             "markets": {
                 "active_count": len(active_markets),
+                "broad_count": broad_markets,
                 "markets": active_markets[:20],  # Cap to avoid huge files
             },
             "positions": {

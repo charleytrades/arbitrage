@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     market_refresh_interval_sec: int = Field(30, alias="MARKET_REFRESH_INTERVAL_SEC")
 
     # ── Broad market scan (cross-outcome arb on ALL binary markets) ─
-    broad_scan_enabled: bool = Field(True, alias="BROAD_SCAN_ENABLED")
+    broad_scan_enabled: bool = Field(False, alias="BROAD_SCAN_ENABLED")
     broad_scan_refresh_sec: int = Field(300, alias="BROAD_SCAN_REFRESH_SEC")
     broad_scan_max_markets: int = Field(500, alias="BROAD_SCAN_MAX_MARKETS")
 

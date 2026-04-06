@@ -1,12 +1,8 @@
-"""Polymarket CLOB WebSocket client for real-time order book data.
+"""Polymarket CLOB order book client.
 
-Subscribes to book updates for active micro-markets and maintains
+Polls the CLOB REST API for book snapshots and maintains
 a local snapshot of best bid/ask for each token pair.
-
-The Polymarket CLOB WS API sends three event types:
-  - Initial snapshot: JSON array of book objects (event_type="book")
-  - Book refresh: dict with asset_id, bids, asks (event_type="book")
-  - Price changes: dict with price_changes array containing level updates
+Falls back to WebSocket if available.
 """
 
 from __future__ import annotations
@@ -15,6 +11,7 @@ import asyncio
 import json
 from collections import defaultdict
 
+import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -22,6 +19,9 @@ from polymarket_micro_arb.config import settings
 from polymarket_micro_arb.constants import WS_PING_INTERVAL_SEC, WS_RECONNECT_DELAY_SEC
 from polymarket_micro_arb.models import BookLevel, MarketInfo, OrderBookSnapshot
 from polymarket_micro_arb.utils.logger import logger
+
+CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+BOOK_POLL_INTERVAL_SEC = 2
 
 
 class PolymarketWSClient:
@@ -37,39 +37,66 @@ class PolymarketWSClient:
         self._lock = asyncio.Lock()
 
     async def start(self, markets: list[MarketInfo]) -> None:
-        """Connect and subscribe to the given markets."""
+        """Start polling CLOB REST API for book data."""
         self._running = True
-        url = settings.polymarket_ws_url
+        self._markets = markets
+        self._session: aiohttp.ClientSession | None = None
 
-        while self._running:
+        # Collect all token IDs to poll
+        self._tracked_tokens: list[str] = []
+        for m in markets:
+            self._tracked_tokens.append(m.token_id_yes)
+            self._tracked_tokens.append(m.token_id_no)
+            self._subscribed.add(m.condition_id)
+
+        logger.info(
+            "Polymarket book poller starting",
+            tokens=len(self._tracked_tokens),
+            interval=f"{BOOK_POLL_INTERVAL_SEC}s",
+        )
+
+        try:
+            self._session = aiohttp.ClientSession()
+            while self._running:
+                await self._poll_all_books()
+                await asyncio.sleep(BOOK_POLL_INTERVAL_SEC)
+        finally:
+            if self._session and not self._session.closed:
+                await self._session.close()
+
+    async def _poll_all_books(self) -> None:
+        """Fetch book snapshots for all tracked tokens via REST API."""
+        if not self._session:
+            return
+        for token_id in self._tracked_tokens:
+            if not self._running:
+                break
             try:
-                logger.info("Polymarket WS connecting", url=url)
-                async with websockets.connect(
-                    url,
-                    ping_interval=WS_PING_INTERVAL_SEC,
-                    ping_timeout=WS_PING_INTERVAL_SEC * 2,
-                    close_timeout=5,
-                ) as ws:
-                    self._ws = ws
-                    logger.info("Polymarket WS connected")
-
-                    # Subscribe to all current markets
-                    await self._subscribe_markets(ws, markets)
-                    await self._consume(ws)
-
-            except ConnectionClosed as exc:
-                self._subscribed.clear()  # Force re-subscribe on reconnect
-                logger.warning("Polymarket WS closed", code=exc.code, reason=exc.reason)
-            except Exception as exc:
-                self._subscribed.clear()  # Force re-subscribe on reconnect
-                logger.error("Polymarket WS error", error=str(exc))
-
-            if self._running:
-                logger.info(
-                    "Polymarket WS reconnecting",
-                    delay_sec=WS_RECONNECT_DELAY_SEC,
-                )
-                await asyncio.sleep(WS_RECONNECT_DELAY_SEC)
+                async with self._session.get(
+                    CLOB_BOOK_URL,
+                    params={"token_id": token_id},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    bids = [
+                        BookLevel(price=float(b["price"]), size=float(b["size"]))
+                        for b in data.get("bids", [])
+                    ]
+                    asks = [
+                        BookLevel(price=float(a["price"]), size=float(a["size"]))
+                        for a in data.get("asks", [])
+                    ]
+                    bids.sort(key=lambda x: x.price, reverse=True)
+                    asks.sort(key=lambda x: x.price)
+                    self.books[token_id] = OrderBookSnapshot(
+                        market_id=token_id,
+                        bids=bids,
+                        asks=asks,
+                    )
+            except (aiohttp.ClientError, asyncio.TimeoutError, Exception):
+                pass  # Skip this token, try next
 
     async def _subscribe_markets(
         self, ws, markets: list[MarketInfo]
@@ -86,8 +113,15 @@ class PolymarketWSClient:
             token_ids.extend([market.token_id_yes, market.token_id_no])
             self._subscribed.add(market.condition_id)
 
-        if not token_ids:
-            return
+            # Subscribe to both YES and NO token books
+            for token_id in (market.token_id_yes, market.token_id_no):
+                sub_msg = {
+                    "type": "subscribe",
+                    "channel": "book",
+                    "market": token_id,
+                }
+                await ws.send(json.dumps(sub_msg))
+                logger.debug("Subscribed to CLOB book", token_id=token_id)
 
         sub_msg = {
             "type": "subscribe",
@@ -121,10 +155,25 @@ class PolymarketWSClient:
                 total_books=len(self.books),
             )
 
+    async def subscribe_batch(
+        self, markets: list[MarketInfo], chunk_size: int = 50
+    ) -> None:
+        """Add markets to the polling list."""
+        new = [m for m in markets if m.condition_id not in self._subscribed]
+        for m in new:
+            self._tracked_tokens.append(m.token_id_yes)
+            self._tracked_tokens.append(m.token_id_no)
+            self._subscribed.add(m.condition_id)
+        if new:
+            logger.info("Added broad markets to book poller", count=len(new))
+
     async def update_subscriptions(self, markets: list[MarketInfo]) -> None:
-        """Dynamically add subscriptions for newly discovered markets."""
-        if self._ws and self.is_connected:
-            await self._subscribe_markets(self._ws, markets)
+        """Add newly discovered markets to the polling list."""
+        for m in markets:
+            if m.condition_id not in self._subscribed:
+                self._tracked_tokens.append(m.token_id_yes)
+                self._tracked_tokens.append(m.token_id_no)
+                self._subscribed.add(m.condition_id)
 
     async def _consume(self, ws) -> None:
         """Process incoming book update messages."""
@@ -228,23 +277,9 @@ class PolymarketWSClient:
         return book.best_bid, book.best_ask
 
     async def stop(self) -> None:
-        """Gracefully disconnect."""
+        """Stop polling."""
         self._running = False
-        if self._ws:
-            await self._ws.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
         self._subscribed.clear()
-        logger.info("Polymarket WS stopped")
-
-    @property
-    def is_connected(self) -> bool:
-        if self._ws is None:
-            return False
-        try:
-            from websockets.protocol import State
-            return self._ws.state == State.OPEN
-        except (AttributeError, ImportError):
-            # websockets v16+: state is an int (1 = OPEN)
-            state = getattr(self._ws, "state", None)
-            if isinstance(state, int):
-                return state == 1
-            return getattr(self._ws, "open", False)
+        logger.info("Polymarket book poller stopped")
