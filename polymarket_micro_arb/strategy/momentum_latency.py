@@ -106,7 +106,7 @@ class MomentumLatencyStrategy:
 
             # Need sufficient Binance tick data
             binance_window = self._binance_prices.get(market.symbol)
-            if not binance_window or len(binance_window) < 10:
+            if not binance_window or len(binance_window) < 5:
                 logger.debug(
                     "GUARD:TICKS insufficient",
                     market=market.slug,
