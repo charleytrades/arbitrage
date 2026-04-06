@@ -17,8 +17,10 @@ Graceful shutdown on SIGTERM/SIGINT.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -141,6 +143,7 @@ class Bot:
             f"Launching task group — {len(self._markets)} markets, "
             f"Binance WS + Bybit WS + Polymarket WS"
             + (f" + Drift BET" if self._drift_client else "")
+            + (f" + Broad scanner" if settings.broad_scan_enabled else "")
         )
         try:
             async with asyncio.TaskGroup() as tg:
@@ -157,6 +160,10 @@ class Bot:
                 tg.create_task(self._heartbeat_loop(), name="heartbeat")
                 tg.create_task(self._daily_summary_loop(), name="daily_summary")
                 tg.create_task(self._state_update_loop(), name="state_writer")
+                if settings.broad_scan_enabled:
+                    tg.create_task(
+                        self._broad_market_refresh_loop(), name="broad_scan"
+                    )
                 tg.create_task(self._wait_for_shutdown(), name="shutdown_watcher")
         except* Exception as eg:
             # TaskGroup catches all exceptions from child tasks
@@ -207,12 +214,6 @@ class Bot:
                 # Cross-outcome arb scans micro-buckets + all broad markets
                 all_arb_markets = self._markets + self._broad_markets
                 signals.extend(self._cross_arb.evaluate(all_arb_markets))
-
-                # Cross-platform arb (Polymarket vs Drift)
-                if self._cross_platform_arb:
-                    signals.extend(
-                        self._cross_platform_arb.evaluate(self._markets)
-                    )
 
                 # Cross-platform arb (Polymarket vs Drift)
                 if self._cross_platform_arb:
@@ -480,9 +481,11 @@ class Bot:
                     uptime=f"{hours}h{minutes}m",
                     mode=self.mode.value,
                     active_markets=len([m for m in self._markets if m.active]),
+                    broad_markets=len(self._broad_markets),
                     drift_markets=drift_markets,
                     drift_enabled=self._drift_enabled,
                     binance_connected=self._binance_ws.is_connected,
+                    polymarket_books=len(self._polymarket_ws.books),
                     tick_queue_size=self._tick_queue.qsize(),
                     **self._risk.stats,
                     **self._executor.position_stats,
@@ -617,13 +620,33 @@ class Bot:
 
     def _install_signal_handlers(self) -> None:
         """Register SIGTERM/SIGINT handlers for graceful shutdown."""
+        self._signal_count = 0
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self._handle_signal, sig)
 
     def _handle_signal(self, sig: signal.Signals) -> None:
-        logger.info("Received signal", signal=sig.name)
+        self._signal_count += 1
+        if self._signal_count >= 2:
+            logger.info("Second signal received — hard exit")
+            os._exit(1)
+
+        logger.info("Received signal — shutting down", signal=sig.name)
+        # Stop WS clients immediately so their close() doesn't block
+        self._binance_ws._running = False
+        self._bybit_ws._running = False
+        self._polymarket_ws._running = False
         self._shutdown_event.set()
+
+        # Watchdog thread: if async shutdown hangs (websockets v16 close
+        # handshake deadlock), force-exit after 5s.  Works because threads
+        # fire even when the event loop is blocked.
+        def _force_exit():
+            time.sleep(5)
+            logger.info("Shutdown watchdog fired — forcing exit")
+            os._exit(0)
+
+        threading.Thread(target=_force_exit, daemon=True).start()
 
     async def _shutdown(self) -> None:
         """Gracefully shut down all components."""
