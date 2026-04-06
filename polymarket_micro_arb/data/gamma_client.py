@@ -109,6 +109,81 @@ class GammaClient:
             logger.warning("Gamma API error", slug=slug, error=str(exc))
             return None
 
+    # ── Full binary-market scan (paginated) ──────────────────────────
+    async def discover_all_binary_markets(
+        self,
+        known_ids: set[str] | None = None,
+        max_markets: int = 500,
+    ) -> list[MarketInfo]:
+        """Paginate through ALL open Polymarket markets and return
+        every binary market (exactly 2 CLOB tokens) not in *known_ids*.
+
+        Used by the broad cross-outcome arb scanner so it can find
+        YES+NO < $0.99 opportunities across the entire platform.
+        """
+        known_ids = known_ids or set()
+        session = await self._get_session()
+        url = f"{self.base_url}/markets"
+        markets: list[MarketInfo] = []
+        offset = 0
+        page_size = 100
+        far_future = int(time.time()) + 86400 * 365  # 1 year from now
+
+        while len(markets) < max_markets:
+            params = {
+                "closed": "false",
+                "limit": str(page_size),
+                "offset": str(offset),
+            }
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "Broad scan page failed",
+                            status=resp.status,
+                            offset=offset,
+                        )
+                        break
+                    data = await resp.json()
+                    if not data:
+                        break  # No more pages
+
+                    for raw in data:
+                        cid = raw.get("conditionId", raw.get("condition_id", ""))
+                        if not cid or cid in known_ids:
+                            continue
+
+                        parsed = self._parse_market(raw, raw.get("slug", ""))
+                        if parsed is None:
+                            continue  # Not binary (< 2 tokens)
+
+                        # Fill in broad-scan defaults
+                        parsed.symbol = ""
+                        parsed.bucket = "broad"
+                        parsed.start_ts = 0
+                        parsed.end_ts = far_future
+                        markets.append(parsed)
+
+                        if len(markets) >= max_markets:
+                            break
+
+                    # If page was smaller than page_size, we've hit the end
+                    if len(data) < page_size:
+                        break
+                    offset += page_size
+                    await asyncio.sleep(0.2)  # Rate limit API requests
+
+            except (aiohttp.ClientError, Exception) as exc:
+                logger.warning("Broad scan error", offset=offset, error=str(exc))
+                break
+
+        logger.info(
+            "Broad market scan complete",
+            discovered=len(markets),
+            skipped_known=len(known_ids),
+        )
+        return markets
+
     # ── Broad search fallback ───────────────────────────────────────
     async def search_markets(
         self, query: str = "up/down", tag: str = "crypto", limit: int = 50

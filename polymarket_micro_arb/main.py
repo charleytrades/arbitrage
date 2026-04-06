@@ -17,8 +17,10 @@ Graceful shutdown on SIGTERM/SIGINT.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -52,6 +54,8 @@ class Bot:
         self.mode = TradingMode(settings.trading_mode)
         self._shutdown_event = asyncio.Event()
         self._markets: list[MarketInfo] = []
+        self._broad_markets: list[MarketInfo] = []  # All binary markets for cross-outcome arb
+        self._broad_known_ids: set[str] = set()  # Incremental refresh tracking
         self._start_time = time.time()
 
         # ── Data sources ────────────────────────────────────────────
@@ -152,6 +156,8 @@ class Bot:
                 tg.create_task(self._order_management_loop(), name="order_mgmt")
                 if self._drift_client:
                     tg.create_task(self._drift_client.start(), name="drift_bet")
+                if settings.broad_scan_enabled:
+                    tg.create_task(self._broad_market_refresh_loop(), name="broad_scan")
                 tg.create_task(self._heartbeat_loop(), name="heartbeat")
                 tg.create_task(self._daily_summary_loop(), name="daily_summary")
                 tg.create_task(self._state_update_loop(), name="state_writer")
@@ -162,13 +168,27 @@ class Bot:
                 if not isinstance(exc, asyncio.CancelledError):
                     logger.error("Task failed", error=str(exc))
 
-        # Graceful shutdown
-        await self._shutdown()
+        # Graceful shutdown with timeout — don't let cleanup hang forever
+        try:
+            await asyncio.wait_for(self._shutdown(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("Shutdown timed out after 10s — forcing exit")
 
     async def _wait_for_shutdown(self) -> None:
-        """Wait for the shutdown event, then cancel the TaskGroup."""
+        """Wait for the shutdown event, then abort connections and exit."""
         await self._shutdown_event.wait()
-        # Raising CancelledError propagates to TaskGroup and cancels siblings
+        logger.info("Shutdown event received — aborting connections")
+        # Abort WS transports immediately (no close handshake).
+        # websockets v16 close() does a handshake that can hang forever;
+        # transport.abort() drops the TCP connection instantly.
+        for ws_client in (self._binance_ws, self._bybit_ws):
+            if ws_client._ws is not None:
+                try:
+                    ws_client._ws.transport.abort()
+                except Exception:
+                    pass
+        # Brief yield so the WS loops see _running=False and exit
+        await asyncio.sleep(0.5)
         raise asyncio.CancelledError("Shutdown requested")
 
     async def _strategy_loop(self) -> None:
@@ -202,7 +222,9 @@ class Bot:
                 # ── Evaluate strategies ─────────────────────────────
                 signals: list[Signal] = []
                 signals.extend(self._momentum.evaluate(self._markets))
-                signals.extend(self._cross_arb.evaluate(self._markets))
+                # Cross-outcome arb scans micro-buckets + all broad markets
+                all_arb_markets = self._markets + self._broad_markets
+                signals.extend(self._cross_arb.evaluate(all_arb_markets))
 
                 # Cross-platform arb (Polymarket vs Drift)
                 if self._cross_platform_arb:
@@ -370,6 +392,73 @@ class Bot:
             except Exception as exc:
                 logger.error("Market refresh error", error=str(exc))
 
+    async def _broad_market_refresh_loop(self) -> None:
+        """Discover ALL binary markets on Polymarket every N minutes
+        for cross-outcome arb scanning (YES+NO < $0.99)."""
+        logger.info(
+            "Broad market scanner starting",
+            refresh_sec=settings.broad_scan_refresh_sec,
+            max_markets=settings.broad_scan_max_markets,
+        )
+
+        # Initial scan after a short delay (let WS connect first)
+        await asyncio.sleep(10)
+
+        while not self._shutdown_event.is_set():
+            try:
+                new_markets = await self._gamma.discover_all_binary_markets(
+                    known_ids=self._broad_known_ids,
+                    max_markets=settings.broad_scan_max_markets - len(self._broad_markets),
+                )
+
+                if new_markets:
+                    # Track known IDs for incremental refresh
+                    for m in new_markets:
+                        self._broad_known_ids.add(m.condition_id)
+
+                    # Also add micro-bucket condition IDs so we don't double-track
+                    for m in self._markets:
+                        self._broad_known_ids.add(m.condition_id)
+
+                    self._broad_markets.extend(new_markets)
+
+                    # Subscribe to WS book data in batches
+                    await self._polymarket_ws.subscribe_batch(new_markets)
+
+                    logger.info(
+                        "Broad markets updated",
+                        new=len(new_markets),
+                        total_broad=len(self._broad_markets),
+                        total_books=len(self._polymarket_ws.books),
+                    )
+
+                # Remove closed markets (no book data after a while = likely closed)
+                # Simple cleanup: keep only markets that still have book data or are recent
+                if len(self._broad_markets) > 100:
+                    active_broad = []
+                    for m in self._broad_markets:
+                        has_yes_book = self._polymarket_ws.get_book(m.token_id_yes) is not None
+                        has_no_book = self._polymarket_ws.get_book(m.token_id_no) is not None
+                        if has_yes_book or has_no_book:
+                            active_broad.append(m)
+                        else:
+                            self._broad_known_ids.discard(m.condition_id)
+                    if len(active_broad) < len(self._broad_markets):
+                        logger.info(
+                            "Cleaned stale broad markets",
+                            before=len(self._broad_markets),
+                            after=len(active_broad),
+                        )
+                        self._broad_markets = active_broad
+
+                await asyncio.sleep(settings.broad_scan_refresh_sec)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Broad market refresh error", error=str(exc))
+                await asyncio.sleep(60)
+
     async def _order_management_loop(self) -> None:
         """Auto-cancel unfilled orders after ORDER_TTL_SEC (60s)."""
         while not self._shutdown_event.is_set():
@@ -403,6 +492,7 @@ class Bot:
                     uptime=f"{hours}h{minutes}m",
                     mode=self.mode.value,
                     active_markets=len([m for m in self._markets if m.active]),
+                    broad_markets=len(self._broad_markets),
                     drift_markets=drift_markets,
                     drift_enabled=self._drift_enabled,
                     binance_connected=self._binance_ws.is_connected,
@@ -440,6 +530,7 @@ class Bot:
                     active_markets=[
                         m.model_dump() for m in self._markets if m.active
                     ],
+                    broad_markets=len(self._broad_markets),
                     # Positions
                     open_positions=[
                         p.model_dump() for p in self._executor.get_open_positions()
@@ -544,8 +635,25 @@ class Bot:
             loop.add_signal_handler(sig, self._handle_signal, sig)
 
     def _handle_signal(self, sig: signal.Signals) -> None:
-        logger.info("Received signal", signal=sig.name)
+        if self._shutdown_event.is_set():
+            # Second signal — force exit immediately
+            logger.warning("Forced shutdown (second signal)", signal=sig.name)
+            os._exit(1)
+        logger.info("Received signal — shutting down", signal=sig.name)
+        # Stop all WS loops immediately so they don't reconnect
+        self._binance_ws._running = False
+        self._bybit_ws._running = False
+        self._polymarket_ws._running = False
         self._shutdown_event.set()
+        # Watchdog thread: if graceful shutdown takes >5s, force exit.
+        # Must be a thread because the event loop may be blocked.
+        threading.Thread(target=self._force_exit, daemon=True).start()
+
+    @staticmethod
+    def _force_exit() -> None:
+        time.sleep(5)
+        logger.warning("Graceful shutdown timed out after 5s — forcing exit")
+        os._exit(0)
 
     async def _shutdown(self) -> None:
         """Gracefully shut down all components."""

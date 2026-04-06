@@ -107,6 +107,12 @@ class MomentumLatencyStrategy:
             # Need sufficient Binance tick data
             binance_window = self._binance_prices.get(market.symbol)
             if not binance_window or len(binance_window) < 10:
+                logger.debug(
+                    "GUARD:TICKS insufficient",
+                    market=market.slug,
+                    ticks=len(binance_window) if binance_window else 0,
+                    age=f"{age:.1f}s",
+                )
                 continue
 
             # ── Compute momentum from Binance only ──────────────────
@@ -116,6 +122,12 @@ class MomentumLatencyStrategy:
                 (ts, p) for ts, p in binance_window if ts >= bucket_start
             ]
             if len(recent) < 5:
+                logger.debug(
+                    "GUARD:BUCKET_TICKS insufficient",
+                    market=market.slug,
+                    bucket_ticks=len(recent),
+                    age=f"{age:.1f}s",
+                )
                 continue
 
             price_at_open = recent[0][1]
@@ -126,7 +138,26 @@ class MomentumLatencyStrategy:
             going_down = pct_change <= -self.momentum_threshold
 
             if not (going_up or going_down):
+                # Log near-misses (>50% of threshold)
+                if abs(pct_change) >= self.momentum_threshold * 0.5:
+                    logger.info(
+                        "FILTER:MOMENTUM near-miss",
+                        market=market.slug,
+                        pct_change=f"{pct_change:.4f}",
+                        threshold=f"{self.momentum_threshold:.4f}",
+                        age=f"{age:.1f}s",
+                        need=f"{self.momentum_threshold - abs(pct_change):.4f} more",
+                    )
                 continue
+
+            # Momentum threshold passed — log it
+            logger.info(
+                "PASSED:MOMENTUM threshold",
+                market=market.slug,
+                pct_change=f"{pct_change:.4f}",
+                direction="UP" if going_up else "DOWN",
+                age=f"{age:.1f}s",
+            )
 
             # ── Volume confirmation ─────────────────────────────────
             if not self.volume_tracker.is_volume_confirmed(
@@ -134,36 +165,46 @@ class MomentumLatencyStrategy:
                 multiplier=self.volume_multiplier,
                 lookback_sec=age,  # Look at volume since bucket open
             ):
-                logger.debug(
-                    "Momentum detected but volume not confirmed",
+                recent_vol = self.volume_tracker.get_recent_volume(market.symbol, age)
+                baseline_vol = self.volume_tracker.get_baseline_volume(market.symbol)
+                logger.info(
+                    "FILTER:VOLUME blocked",
                     market=market.slug,
                     pct_change=f"{pct_change:.4f}",
+                    recent_vol=f"{recent_vol:.2f}",
+                    baseline=f"{baseline_vol:.2f}",
+                    need=f"{self.volume_multiplier}x",
+                    got=f"{recent_vol / max(baseline_vol, 0.001):.2f}x",
                 )
                 continue
 
+            logger.info("PASSED:VOLUME confirmed", market=market.slug)
+
             # ── Multi-venue confirmation (Binance + Bybit agree) ────
-            # Optional: if Bybit data is available, use it as extra
-            # confidence but don't reject signals when Bybit is missing.
             bybit_price = self._bybit_prices.get(market.symbol)
-            bybit_confirms = True  # Default to True if no Bybit data
             if bybit_price is not None and price_at_open > 0:
                 bybit_pct = (bybit_price - price_at_open) / price_at_open
+                # Both venues must agree on direction
                 if going_up and bybit_pct < self.momentum_threshold * 0.5:
-                    bybit_confirms = False
-                    logger.debug(
-                        "Bybit disagrees on upward momentum (non-blocking)",
+                    logger.info(
+                        "FILTER:BYBIT disagrees (UP)",
                         market=market.slug,
                         binance_pct=f"{pct_change:.4f}",
                         bybit_pct=f"{bybit_pct:.4f}",
+                        need=f">= {self.momentum_threshold * 0.5:.4f}",
                     )
+                    continue
                 if going_down and bybit_pct > -self.momentum_threshold * 0.5:
-                    bybit_confirms = False
-                    logger.debug(
-                        "Bybit disagrees on downward momentum (non-blocking)",
+                    logger.info(
+                        "FILTER:BYBIT disagrees (DOWN)",
                         market=market.slug,
                         binance_pct=f"{pct_change:.4f}",
                         bybit_pct=f"{bybit_pct:.4f}",
+                        need=f"<= {-self.momentum_threshold * 0.5:.4f}",
                     )
+                    continue
+
+            logger.info("PASSED:BYBIT confirmed", market=market.slug)
 
             # ── Check Polymarket book for lag (the actual edge) ─────
             signal = self._check_latency_edge(
@@ -172,6 +213,38 @@ class MomentumLatencyStrategy:
             if signal:
                 self._signaled_markets.add(market.condition_id)
                 signals.append(signal)
+            else:
+                # Log why the edge check failed
+                yes_bid, yes_ask = self.polymarket_ws.get_best_prices(
+                    market.token_id_yes
+                )
+                no_bid, no_ask = self.polymarket_ws.get_best_prices(
+                    market.token_id_no
+                )
+                move_strength = abs(pct_change) / self.momentum_threshold
+                implied_fair = min(0.95, 0.5 + (move_strength - 1.0) * 0.15 + 0.15)
+                if going_up:
+                    edge = implied_fair - yes_ask
+                    logger.info(
+                        "FILTER:EDGE too small (UP)",
+                        market=market.slug,
+                        yes_ask=yes_ask,
+                        implied_fair=f"{implied_fair:.4f}",
+                        edge=f"{edge:.4f}",
+                        min_needed=f"{settings.min_spread_profit:.4f}",
+                        verdict="Polymarket already repriced" if edge <= 0 else "edge below min_spread_profit",
+                    )
+                else:
+                    edge = implied_fair - no_ask
+                    logger.info(
+                        "FILTER:EDGE too small (DOWN)",
+                        market=market.slug,
+                        no_ask=no_ask,
+                        implied_fair=f"{implied_fair:.4f}",
+                        edge=f"{edge:.4f}",
+                        min_needed=f"{settings.min_spread_profit:.4f}",
+                        verdict="Polymarket already repriced" if edge <= 0 else "edge below min_spread_profit",
+                    )
 
         return signals
 
