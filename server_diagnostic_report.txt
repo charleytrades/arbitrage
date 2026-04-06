@@ -1,0 +1,54 @@
+===============================================================
+  POLYMARKET BOT DIAGNOSTIC REPORT
+  Generated: 2026-04-05 18:44 UTC
+  Bot path:  /home/marcel/trading/arbitrage
+===============================================================
+
+[CONFIG]        GO
+  - All 21 keys set, no placeholders
+  - PRIVATE_KEY: valid 64 hex chars
+  - Key derives to POLYGON_ADDRESS: confirmed match
+  - TRADING_MODE: paper_trade
+
+[ENVIRONMENT]   GO
+  - Python 3.12.3, venv .venv/ (uv 0.10.9)
+  - All 11 requirements installed and version-compatible
+
+[CONNECTIVITY]  GO
+  - Polymarket geoblock: NOT BLOCKED (200)
+  - CLOB API /time: OK
+  - Gamma API: OK (markets returned)
+  - Binance WS: tick received (BTC $67,431)
+  - Polymarket WS: connected, book data flowing
+
+[WALLET]        GO
+  - Address: 0xca081D8095068fAc42D519484482660E50C169a1
+  - MATIC:   9.98  (sufficient for gas)
+  - USDC.e:  7.65  (trading bankroll)
+  - WARNING: Bankroll is thin — MIN_ORDER_SIZE is $5
+
+[PAPER TRADE]   GO
+  - 12 markets discovered (BTC/ETH/SOL up/down 5m & 15m)
+  - 417 Binance ticks in 30s
+  - 24 Polymarket order books tracked
+  - 298 strategy loop cycles, 0 errors
+
+[WEBSOCKET]     GO (FIXED)
+  - Root cause: websockets v16 API change broke is_connected
+  - Fix applied to polymarket_ws.py + binance_ws.py
+  - 30s stability test: PASS (16 messages, no disconnects)
+
+===============================================================
+  OVERALL: GO
+===============================================================
+
+  WARNING: Bankroll is only $7.65 USDC.e. This allows ~1 trade
+  at a time at minimum size ($5). Consider adding more USDC for
+  meaningful paper trading or before switching to live mode.
+
+  NEXT STEP: Start the bot:
+    cd /home/marcel/trading/arbitrage
+    source .venv/bin/activate
+    python -m polymarket_micro_arb.main
+
+===============================================================

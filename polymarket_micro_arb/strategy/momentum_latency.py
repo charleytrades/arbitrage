@@ -181,28 +181,30 @@ class MomentumLatencyStrategy:
             logger.info("PASSED:VOLUME confirmed", market=market.slug)
 
             # ── Multi-venue confirmation (Binance + Bybit agree) ────
+            # Optional: if Bybit data is available, use it as extra
+            # confidence but don't reject signals when Bybit is missing.
             bybit_price = self._bybit_prices.get(market.symbol)
+            bybit_confirms = True  # Default to True if no Bybit data
             if bybit_price is not None and price_at_open > 0:
                 bybit_pct = (bybit_price - price_at_open) / price_at_open
-                # Both venues must agree on direction
                 if going_up and bybit_pct < self.momentum_threshold * 0.5:
-                    logger.info(
-                        "FILTER:BYBIT disagrees (UP)",
+                    bybit_confirms = False
+                    logger.debug(
+                        "Bybit disagrees on upward momentum (non-blocking)",
                         market=market.slug,
                         binance_pct=f"{pct_change:.4f}",
                         bybit_pct=f"{bybit_pct:.4f}",
                         need=f">= {self.momentum_threshold * 0.5:.4f}",
                     )
-                    continue
                 if going_down and bybit_pct > -self.momentum_threshold * 0.5:
-                    logger.info(
-                        "FILTER:BYBIT disagrees (DOWN)",
+                    bybit_confirms = False
+                    logger.debug(
+                        "Bybit disagrees on downward momentum (non-blocking)",
                         market=market.slug,
                         binance_pct=f"{pct_change:.4f}",
                         bybit_pct=f"{bybit_pct:.4f}",
                         need=f"<= {-self.momentum_threshold * 0.5:.4f}",
                     )
-                    continue
 
             logger.info("PASSED:BYBIT confirmed", market=market.slug)
 

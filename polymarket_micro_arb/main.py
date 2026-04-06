@@ -154,8 +154,6 @@ class Bot:
                 tg.create_task(self._order_management_loop(), name="order_mgmt")
                 if self._drift_client:
                     tg.create_task(self._drift_client.start(), name="drift_bet")
-                if settings.broad_scan_enabled:
-                    tg.create_task(self._broad_market_refresh_loop(), name="broad_scan")
                 tg.create_task(self._heartbeat_loop(), name="heartbeat")
                 tg.create_task(self._daily_summary_loop(), name="daily_summary")
                 tg.create_task(self._state_update_loop(), name="state_writer")
@@ -209,6 +207,12 @@ class Bot:
                 # Cross-outcome arb scans micro-buckets + all broad markets
                 all_arb_markets = self._markets + self._broad_markets
                 signals.extend(self._cross_arb.evaluate(all_arb_markets))
+
+                # Cross-platform arb (Polymarket vs Drift)
+                if self._cross_platform_arb:
+                    signals.extend(
+                        self._cross_platform_arb.evaluate(self._markets)
+                    )
 
                 # Cross-platform arb (Polymarket vs Drift)
                 if self._cross_platform_arb:
@@ -476,7 +480,6 @@ class Bot:
                     uptime=f"{hours}h{minutes}m",
                     mode=self.mode.value,
                     active_markets=len([m for m in self._markets if m.active]),
-                    broad_markets=len(self._broad_markets),
                     drift_markets=drift_markets,
                     drift_enabled=self._drift_enabled,
                     binance_connected=self._binance_ws.is_connected,

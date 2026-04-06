@@ -2,6 +2,11 @@
 
 Subscribes to book updates for active micro-markets and maintains
 a local snapshot of best bid/ask for each token pair.
+
+The Polymarket CLOB WS API sends three event types:
+  - Initial snapshot: JSON array of book objects (event_type="book")
+  - Book refresh: dict with asset_id, bids, asks (event_type="book")
+  - Price changes: dict with price_changes array containing level updates
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ class PolymarketWSClient:
 
     def __init__(self) -> None:
         self._running = False
-        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._ws = None
         # token_id -> latest snapshot
         self.books: dict[str, OrderBookSnapshot] = {}
         # Condition IDs we're currently subscribed to
@@ -65,24 +70,30 @@ class PolymarketWSClient:
                 await asyncio.sleep(WS_RECONNECT_DELAY_SEC)
 
     async def _subscribe_markets(
-        self, ws: websockets.WebSocketClientProtocol, markets: list[MarketInfo]
+        self, ws, markets: list[MarketInfo]
     ) -> None:
-        """Send subscription messages for each market's token pairs."""
+        """Send a single subscription for all markets' token pairs.
+
+        The CLOB WS API expects ``assets_ids`` (not ``markets``) in the
+        subscription payload.  Sending ``markets`` causes a 1006 disconnect.
+        """
+        token_ids: list[str] = []
         for market in markets:
             if market.condition_id in self._subscribed:
                 continue
-
-            # Subscribe to both YES and NO token books
-            for token_id in (market.token_id_yes, market.token_id_no):
-                sub_msg = {
-                    "type": "subscribe",
-                    "channel": "book",
-                    "markets": [token_id],
-                }
-                await ws.send(json.dumps(sub_msg))
-                logger.debug("Subscribed to CLOB book", token_id=token_id)
-
+            token_ids.extend([market.token_id_yes, market.token_id_no])
             self._subscribed.add(market.condition_id)
+
+        if not token_ids:
+            return
+
+        sub_msg = {
+            "type": "subscribe",
+            "channel": "book",
+            "assets_ids": token_ids,
+        }
+        await ws.send(json.dumps(sub_msg))
+        logger.info("Subscribed to CLOB book", token_count=len(token_ids))
 
     async def subscribe_batch(
         self, markets: list[MarketInfo], chunk_size: int = 50
@@ -119,19 +130,10 @@ class PolymarketWSClient:
 
     async def update_subscriptions(self, markets: list[MarketInfo]) -> None:
         """Dynamically add subscriptions for newly discovered markets."""
-        ws_open = False
-        if self._ws:
-            try:
-                ws_open = self._ws.state.name == "OPEN"
-            except AttributeError:
-                try:
-                    ws_open = self._ws.open
-                except AttributeError:
-                    ws_open = False
-        if ws_open:
+        if self._ws and self.is_connected:
             await self._subscribe_markets(self._ws, markets)
 
-    async def _consume(self, ws: websockets.WebSocketClientProtocol) -> None:
+    async def _consume(self, ws) -> None:
         """Process incoming book update messages."""
         async for raw_msg in ws:
             if not self._running:
@@ -139,79 +141,85 @@ class PolymarketWSClient:
 
             try:
                 msg = json.loads(raw_msg)
-                self._handle_message(msg)
-            except (json.JSONDecodeError, KeyError) as exc:
+                if isinstance(msg, list):
+                    # Initial snapshot: array of book objects
+                    for book_obj in msg:
+                        self._handle_book_snapshot(book_obj)
+                elif isinstance(msg, dict):
+                    self._handle_message(msg)
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
                 logger.debug("Polymarket WS parse error", error=str(exc))
 
+    def _handle_book_snapshot(self, book_obj: dict) -> None:
+        """Parse a single book snapshot into local state."""
+        asset_id = book_obj.get("asset_id", "")
+        if not asset_id:
+            return
+
+        bids = [
+            BookLevel(price=float(b["price"]), size=float(b["size"]))
+            for b in book_obj.get("bids", [])
+        ]
+        asks = [
+            BookLevel(price=float(a["price"]), size=float(a["size"]))
+            for a in book_obj.get("asks", [])
+        ]
+
+        bids.sort(key=lambda x: x.price, reverse=True)
+        asks.sort(key=lambda x: x.price)
+
+        self.books[asset_id] = OrderBookSnapshot(
+            market_id=asset_id,
+            bids=bids,
+            asks=asks,
+        )
+
     def _handle_message(self, msg: dict) -> None:
-        """Parse a book snapshot or delta and update local state."""
-        # The CLOB WS sends different message types
-        msg_type = msg.get("type", "")
+        """Route dict messages by event_type."""
+        event_type = msg.get("event_type", "")
 
-        if msg_type in ("book", "book_snapshot"):
-            market_id = msg.get("market", msg.get("asset_id", ""))
-            if not market_id:
-                return
+        if event_type == "book":
+            # Full book refresh for a single asset
+            self._handle_book_snapshot(msg)
 
-            bids = [
-                BookLevel(price=float(b["price"]), size=float(b["size"]))
-                for b in msg.get("bids", [])
-            ]
-            asks = [
-                BookLevel(price=float(a["price"]), size=float(a["size"]))
-                for a in msg.get("asks", [])
-            ]
+        elif "price_changes" in msg:
+            # Incremental level updates
+            for change in msg["price_changes"]:
+                asset_id = change.get("asset_id", "")
+                if not asset_id:
+                    continue
 
-            # Sort: bids descending, asks ascending
-            bids.sort(key=lambda x: x.price, reverse=True)
-            asks.sort(key=lambda x: x.price)
+                price = float(change["price"])
+                size = float(change["size"])
+                side = change.get("side", "").upper()
 
-            self.books[market_id] = OrderBookSnapshot(
-                market_id=market_id,
-                bids=bids,
-                asks=asks,
-            )
+                book = self.books.get(asset_id)
+                if not book:
+                    continue
 
-        elif msg_type == "book_delta":
-            # Incremental update – apply to existing snapshot
-            market_id = msg.get("market", msg.get("asset_id", ""))
-            if market_id not in self.books:
-                return
+                levels = book.bids if side == "BUY" else book.asks
 
-            book = self.books[market_id]
-
-            # Apply bid changes
-            for change in msg.get("bids", []):
-                price, size = float(change["price"]), float(change["size"])
                 if size == 0:
-                    book.bids = [b for b in book.bids if b.price != price]
+                    if side == "BUY":
+                        book.bids = [b for b in book.bids if b.price != price]
+                    else:
+                        book.asks = [a for a in book.asks if a.price != price]
                 else:
-                    # Update or insert
                     updated = False
-                    for b in book.bids:
-                        if b.price == price:
-                            b.size = size
+                    for lvl in levels:
+                        if lvl.price == price:
+                            lvl.size = size
                             updated = True
                             break
                     if not updated:
-                        book.bids.append(BookLevel(price=price, size=size))
-                    book.bids.sort(key=lambda x: x.price, reverse=True)
+                        levels.append(BookLevel(price=price, size=size))
 
-            # Apply ask changes
-            for change in msg.get("asks", []):
-                price, size = float(change["price"]), float(change["size"])
-                if size == 0:
-                    book.asks = [a for a in book.asks if a.price != price]
-                else:
-                    updated = False
-                    for a in book.asks:
-                        if a.price == price:
-                            a.size = size
-                            updated = True
-                            break
-                    if not updated:
-                        book.asks.append(BookLevel(price=price, size=size))
-                    book.asks.sort(key=lambda x: x.price)
+                    if side == "BUY":
+                        book.bids.sort(key=lambda x: x.price, reverse=True)
+                    else:
+                        book.asks.sort(key=lambda x: x.price)
+
+        # Ignore last_trade_price and other event types
 
     def get_book(self, token_id: str) -> OrderBookSnapshot | None:
         """Get the latest order book for a token."""
@@ -233,3 +241,17 @@ class PolymarketWSClient:
             await self._ws.close()
         self._subscribed.clear()
         logger.info("Polymarket WS stopped")
+
+    @property
+    def is_connected(self) -> bool:
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+            return self._ws.state == State.OPEN
+        except (AttributeError, ImportError):
+            # websockets v16+: state is an int (1 = OPEN)
+            state = getattr(self._ws, "state", None)
+            if isinstance(state, int):
+                return state == 1
+            return getattr(self._ws, "open", False)

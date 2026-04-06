@@ -90,10 +90,22 @@ python scripts/daily_report.py
 
 ## Environment
 
-- Python 3.11+
-- Key deps: `py-clob-client`, `websockets`, `aiohttp`, `pydantic`, `loguru`, `streamlit`
+- Python 3.12.3, uv-managed venv at `.venv/` (use `uv pip`, not `pip`)
+- Key deps: `py-clob-client`, `websockets` v16, `aiohttp`, `pydantic`, `loguru`, `streamlit`
 - Config via `.env` (see `.env.example`)
 - Secrets: `PRIVATE_KEY` (Polygon EOA), `SOLANA_PRIVATE_KEY` — NEVER log or display these
+- Polygon chain (ID 137), wallet funded with MATIC + USDC.e
+- websockets v16: `is_connected` uses `ws.state == 1` (not `ws.open` which was removed)
+
+## Systemd Services
+
+Both run as user services, auto-restart, survive reboots:
+```bash
+systemctl --user status polymarket-bot
+systemctl --user status polymarket-dashboard
+systemctl --user restart polymarket-bot
+journalctl --user -u polymarket-bot -f        # live logs
+```
 
 ## Drift BET Integration
 
@@ -114,7 +126,17 @@ Enable with `DRIFT_ENABLED=true` in `.env`. Requires:
 - BET markets are perp markets with `-BET` suffix. Long=YES, Short=NO.
 - Paper trade mode works without Gateway — simulates fills locally.
 
-The Drift client polls every 5s for active crypto prediction markets, matches them to Polymarket buckets by symbol + timeframe, and the cross-platform strategy scans for price discrepancies.
+## Standalone Predictor (`predictor/`)
+
+XGBoost-based crypto price direction predictor. Fully standalone from the arb bot.
+
+```bash
+python -m predictor fetch              # Download Binance klines
+python -m predictor train              # Walk-forward XGBoost training
+python -m predictor predict --once     # Single prediction pass
+python -m predictor backtest           # Evaluate on historical data
+streamlit run predictor_dashboard.py   # Prediction dashboard
+```
 
 ## Common Tasks
 
