@@ -14,14 +14,15 @@ from loguru import logger as _loguru_logger
 # Remove default handler so we control the format
 _loguru_logger.remove()
 
-# ── JSON-structured handler to stderr ───────────────────────────────
+# ── Human-readable handler to stderr (what you see in terminal) ─────
 _loguru_logger.add(
     sys.stderr,
-    level="DEBUG",
-    serialize=True,  # Outputs JSON lines
+    level="INFO",
+    format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
+    colorize=True,
     backtrace=True,
-    diagnose=False,  # Avoid leaking locals in production
-    enqueue=True,  # Thread-safe async-friendly queue
+    diagnose=False,
+    enqueue=True,
 )
 
 # ── Rotating file handler ──────────────────────────────────────────

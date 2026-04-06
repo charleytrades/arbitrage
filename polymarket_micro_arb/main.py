@@ -125,11 +125,21 @@ class Bot:
             await self._drift_executor.initialize()
 
         # Discover initial markets
+        logger.info("Discovering Polymarket micro-markets via Gamma API...")
         self._markets = await self._gamma.discover_current_markets()
         if not self._markets:
-            logger.warning("No markets discovered – will retry in refresh loop")
+            logger.warning(
+                "No markets discovered — this is normal if Polymarket doesn't "
+                "have active micro-bucket markets right now. Will retry every "
+                f"{settings.market_refresh_interval_sec}s."
+            )
 
         # Launch all tasks with structured concurrency
+        logger.info(
+            f"Launching task group — {len(self._markets)} markets, "
+            f"Binance WS + Bybit WS + Polymarket WS"
+            + (f" + Drift BET" if self._drift_client else "")
+        )
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self._binance_ws.start(), name="binance_ws")
@@ -164,6 +174,7 @@ class Bot:
     async def _strategy_loop(self) -> None:
         """Core loop: consume ticks, evaluate strategies, execute trades."""
         logger.info("Strategy loop started")
+        _idle_logged = False
 
         while not self._shutdown_event.is_set():
             try:
@@ -178,8 +189,12 @@ class Bot:
                         break
 
                 if not self._markets:
+                    if not _idle_logged:
+                        logger.info("Strategy loop idle — no active markets. Waiting for market refresh.")
+                        _idle_logged = True
                     await asyncio.sleep(0.5)
                     continue
+                _idle_logged = False
 
                 # Keep Bybit prices reference up to date
                 self._momentum.set_bybit_prices(self._bybit_ws.latest_prices)
